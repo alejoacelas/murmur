@@ -1,0 +1,16 @@
+# Swift / SwiftPM
+.build/
+.swiftpm/
+Package.resolved
+*.xcodeproj/xcuserdata/
+DerivedData/
+
+# Build output
+*.app
+dist/
+
+# macOS
+.DS_Store
+
+# Local secrets / config
+.env
