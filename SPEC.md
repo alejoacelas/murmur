@@ -47,6 +47,22 @@ building. Run on the **actual target Mac, in an active GUI login session** (not 
 S1–S3 and S6–S9 are the highest-value; do them first. The spike sources live in `spikes/` and are
 throwaway — none ship in the app.
 
+### Spike results (run 2026-07-04 on the target Mac, macOS 26.3.1, Apple Silicon)
+| # | Result | Notes |
+|---|---|---|
+| S1 | **PASS** at `exact: "0.15.4"` (not 0.12.4 — see §2) | All assumed symbols exist: `AsrManager` (actor), `AsrModels.downloadAndLoad(to:version:…)`, `SlidingWindowAsrManager` (actor), `ASRConfig`, `AudioConverter.resampleAudioFile`, `AsrModelVersion.v2/.v3`. |
+| S2 | **PASS** | All five fixtures transcribe correctly; `silence.wav` → empty at the model level; Parakeet writes numerals ("Testing 123."), so `numbers.wav` expects `testing 123` normalized. |
+| S3 | **PASS** (spec corrected) | Real signature: `transcribe(_ samples/URL/buffer, decoderState: inout TdtDecoderState, language: Language? = nil) async throws -> ASRResult`. No `source:` — red-team confirmed. `TdtDecoderState.make(decoderLayers: await asr.decoderLayerCount)` builds the state. |
+| S4 | **PASS** | Warm load from default cache = ~0.5 s, no re-download. `to:` override works but expects the **version-specific dir** (`<cache>/parakeet-tdt-0.6b-v2`) — `repoPath` strips the last component. First load from a *new path* pays a one-time ~50 s CoreML/ANE compile. |
+| S5 | **PASS** | External-feed streaming: `streamAudio(buffer)` + `transcriptionUpdates` AsyncStream (confirmed/volatile two-tier) + `finish()`. Both managers can share one loaded `AsrModels` (kills the double-model memory worry). Streaming final text has glitches vs batch → batch stays authoritative. |
+| S6/S7 | **SKIPPED** | Needs a human pressing Fn+Space, and Wispr Flow owns Fn on this machine — Fn+Space unverifiable here. Per §4.1/§13 fallback: **Ctrl+Space is the shipping default**; `fn-space` remains a preset for machines where it can be verified. |
+| S8 | **FLIPPED** | On macOS 26.3, `open` **did** propagate `MURMUR_TRIGGER` to the app. We still launch by exec for tests (belt-and-suspenders; older macOS drops env). |
+| S9 | **SKIPPED** | Design already avoids AppleScript entirely (InsertionProbe, §10.5); running the probe would itself trigger the 4th-domain TCC prompt while the user is away. |
+| S10 | **SKIPPED** | Unmanaged Mac (no MDM), `sudo` unavailable unattended. Moot: all three grants were made manually in the bootstrap session and verified live. |
+| S11 | **PASS** | DR identical across rebuild+resign: `identifier "com.alejoacelas.Murmur" and certificate root = H"dc66…"`. TCC grants persist. |
+| S12 | **PASS** | SIGKILLed a live CAF writer at ~8.6 s; partial CAF reads via `afinfo` and converts via `afconvert` losslessly. |
+| S13 | **PASS** | Active Aqua session (`gui/501`), Secure Input off. |
+
 ---
 
 ## 1. Scope
@@ -85,7 +101,7 @@ If a feature isn't in "Must have," don't build it. A smaller app that nails the 
 |---|---|
 | Platform | macOS 14.0+ (Sonoma), Apple Silicon only |
 | Language | Swift 6, SwiftUI + AppKit (menu bar `MenuBarExtra`, HUD `NSPanel`) |
-| Bundle id | **`com.alejoacelas.murmur`** — fixed. Never let the agent invent one; PPPC/TCC/DR all key on it. |
+| Bundle id | **`com.alejoacelas.Murmur`** (capital M) — fixed. The bootstrap session granted all three TCC permissions against this exact id + the "Murmur Dev" cert, and the designated requirement embeds it (S11); changing case would orphan the grants. |
 | Packaging | A **`MurmurKit` library** target holds all logic. Thin executables link it: **`Murmur.app`** (GUI), **`murmurctl`** (CLI client), **`InsertionProbe.app`** (test target, [§10.5](#105-end-to-end-via-the-control-socket)). No dual-mode GUI/CLI binary. |
 | Build | SwiftPM from CLI (`swift build`) + a bundling script. **Never require the Xcode GUI.** |
 | Transcription | [`FluidAudio`](https://github.com/FluidInference/FluidAudio) — Parakeet on the Apple Neural Engine (CoreML). **No Python.** Hidden behind a `TranscriptionBackend` protocol ([§8.1](#81-transcription-backend)). |
@@ -97,7 +113,9 @@ If a feature isn't in "Must have," don't build it. A smaller app that nails the 
 dependencies: [
     // EXACT pin: pre-1.0 packages break API across 0.x; an autonomous build must be reproducible.
     // Bump deliberately, re-run the §0 spikes, never float with `from:`.
-    .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.12.4"),
+    // 0.15.4 (not 0.12.4): the repo's committed Package.resolved pins 0.15.4 and S1–S5 verified
+    // the full API surface against it.
+    .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.15.4"),
     .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.4.0"),
 ]
 ```
@@ -187,11 +205,12 @@ in CoreGraphics HID flags). The only mechanism is a **`CGEventTap`**, which need
 Monitoring** ([§8.6](#86-permissions)).
 
 ### 4.1 Triggers (presets only in v1)
-- **Testing + fallback default: `Ctrl`+`Space`, toggle mode** — non-Fn, deterministic, unaffected
-  by Wispr Flow owning `Fn`. **All automated tests use this.**
-- **Production default: `Fn`+`Space`, toggle** — *pending S6/S7 verification on the real hardware*.
-  If S7 shows macOS wins the Fn+Space chord (input-source/emoji), ship `Ctrl`+`Space` as the
-  production default too and note it.
+- **Testing + production default: `Ctrl`+`Space`, toggle mode** — non-Fn, deterministic, unaffected
+  by Wispr Flow owning `Fn`. **All automated tests use this.** (S6/S7 could not run on this
+  machine — Wispr Flow owns Fn — so per the fallback rule below, Ctrl+Space ships as the default.)
+- **`Fn`+`Space` remains a selectable preset, unverified** — S6/S7 were skipped (no human at the
+  keyboard; Fn owned by Wispr Flow here). Verify on hardware where Fn is free before making it a
+  default anywhere.
 - Toggle only (tap on / tap off). No hold-to-talk, no modifier-alone, no custom recorder in v1.
 
 Presets are selected by name from config or `$MURMUR_TRIGGER` (`ctrl-space` | `fn-space`). **Do not
@@ -333,9 +352,12 @@ protocol TranscriptionBackend {
     func makeStreamingSession() -> StreamingSession?
 }
 ```
-`FluidAudioBackend` wraps `AsrModels.downloadAndLoad(version: .v2)` +
-`AsrManager(config: .default)` + `transcribe(...)` **using the exact signature discovered in S1–S3**
-(drop `source:` if upstream lacks it). Load once, keep warm.
+`FluidAudioBackend` wraps `AsrModels.downloadAndLoad(to:version:)` + `AsrManager(config: .default)`
++ `loadModels(_:)`, then per call `transcribe(_:decoderState:)` with a fresh
+`TdtDecoderState.make(decoderLayers: await asr.decoderLayerCount)` — the exact 0.15.4 signature
+verified in S1–S3 (**no `source:` argument**). Load once, keep warm. Streaming shares the same
+loaded `AsrModels` via `SlidingWindowAsrManager.loadModels(_:)` (verified in S5 — one model in
+memory, two managers).
 
 ### 8.2 Transcription passes
 - **Batch pass = authoritative.** On stop, transcribe the full authoritative audio in one pass; its

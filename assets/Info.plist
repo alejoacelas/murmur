@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Murmur</string>
+    <key>CFBundleDisplayName</key>
+    <string>Murmur</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.alejoacelas.Murmur</string>
+    <key>CFBundleExecutable</key>
+    <string>Murmur</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Murmur records your voice locally to transcribe it on-device with Parakeet. Audio never leaves this Mac.</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>MIT License. Transcription by NVIDIA Parakeet (CC-BY-4.0) via FluidAudio (Apache-2.0).</string>
+</dict>
+</plist>

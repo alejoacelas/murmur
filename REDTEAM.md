@@ -90,6 +90,22 @@ almost all of it. Below, "→ §" points to where it landed in v2.
 |---|---|
 | (Implied) drop the live HUD / consider WhisperKit | The live transcript is an explicit user must-have, and Parakeet is non-negotiable, so WhisperKit (not Parakeet) is a non-starter. Kept FluidAudio + the HUD; addressed the underlying risks (streaming fragility, HUD unverifiability) via best-effort framing + control-API observability instead of cutting the feature. |
 
+## Spike outcomes (v2 → implementation, 2026-07-04)
+The §0 spikes ran on the target Mac (macOS 26.3.1, Apple Silicon). Full table in SPEC.md §0. The
+spec corrections they forced:
+- **FluidAudio pin is `exact: "0.15.4"`**, not 0.12.4 — the committed `Package.resolved` pins
+  0.15.4 and the whole API surface (S1/S3/S5) verified against it. `transcribe` takes
+  `decoderState: inout TdtDecoderState` and no `source:` (as this review predicted).
+- **Bundle id stays `com.alejoacelas.Murmur`** (capital M): the bootstrap session's TCC grants and
+  the S11-verified designated requirement embed that exact string; the lowercase id in v2 §2 would
+  have orphaned working grants.
+- **S8 flipped on macOS 26.3**: `open` *did* propagate env vars. Launch-by-exec stays (portable to
+  older macOS), but the failure mode v2 predicted didn't occur on this OS.
+- **Ctrl+Space ships as the production default** — S6/S7 unrunnable here (needs a human; Wispr
+  Flow owns Fn), which triggers exactly the fallback v2 specified.
+- S9/S10 skipped as moot: the design avoids AppleScript entirely, and permissions were granted
+  manually once (unmanaged Mac) and verified live before any code was written.
+
 ## What the model got right that I'd underweighted
 The **`open`-doesn't-pass-env-vars** gotcha (S8) and the **InsertionProbe-over-AppleScript** redesign
 are the two changes most likely to have silently wrecked the autonomous loop; both are now
