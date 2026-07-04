@@ -1,46 +1,81 @@
-# Murmur — implementation spec
+# Murmur — implementation spec (v2)
 
 > Working name is **Murmur** (ties to Parakeet, short, avoids colliding with macOS's own
 > "Dictation"). Rename is a find-and-replace; don't let the name block you.
+>
+> **v2** incorporates a `gpt-5.4-pro` red-team of v1. Every accepted, tempered, and rejected
+> finding is recorded in [REDTEAM.md](REDTEAM.md) with rationale — read it to see *why* the spec
+> looks the way it does.
 
-A minimal, local-first macOS dictation app. A WisprFlow / FluidVoice alternative that does
+A minimal, local-first macOS dictation app. A Wispr Flow / FluidVoice alternative that does
 **one thing**: press a hotkey, speak, and the transcript lands at your cursor — transcribed
-entirely on-device with NVIDIA Parakeet. No cloud, no account, no transcript "cleanup" by
-default.
+entirely on-device with NVIDIA Parakeet. No cloud, no account, no transcript "cleanup" by default.
 
-This document is the complete build spec. It is written so a coding agent can implement and
-**autonomously test the app to reliability with zero manual testing by a human** (see
-[§10 Autonomous testing](#10-autonomous-testing)). Read that section before writing code —
-the testability seams it requires shape the architecture.
+This document is the complete build spec, written so a coding agent can implement and
+**autonomously test the app to reliability with zero manual testing by a human**. Two sections
+gate everything else — **read them before writing any app code**:
+- [§0 Verification spikes](#0-verification-spikes-do-these-first) — probes that must pass before
+  the design is trustworthy. Several v1 assumptions were unverified; §0 makes the agent verify
+  them and rewrite the spec if any fail.
+- [§10 Autonomous testing](#10-autonomous-testing) — the testability seams that shape the
+  architecture.
+
+---
+
+## 0. Verification spikes (do these first)
+
+**Milestone 0. No app/UI code until these pass.** Each probe checks a v1 assumption that, if
+wrong, changes the design. If a probe fails, fix the spec (and note it in REDTEAM.md) before
+building. Run on the **actual target Mac, in an active GUI login session** (not SSH-only).
+
+| # | Verifies | Probe (abbreviated — full commands in [`spikes/`](#11-project-layout)) | If it fails |
+|---|---|---|---|
+| S1 | **FluidAudio public API exists** as assumed | Build a throwaway SwiftPM pkg depending on `exact: "0.12.4"`; `rg` the checkout for `AsrManager`, `AsrModels.downloadAndLoad`, `SlidingWindowAsrManager`, `ASRConfig`, `resampleAudioFile`, `transcribe`, `case v2/v3`. | Rewrite §2/§8 against the real symbols. |
+| S2 | **End-to-end batch transcribe** of a fixture WAV works | 20-line spike using the discovered API → non-empty transcript. | Backend is not viable as specced. |
+| S3 | **`transcribe` signature** — does upstream take a `source:` arg? | Inspect the real method signature. (v1 assumed `transcribe(_:source:)`; upstream README shows `transcribe(samples)`. The `source:` form is from FluidVoice's *fork*.) | Use the real signature; drop `source:`. |
+| S4 | **Model download is deterministic + cacheable** | Time first vs second `ensure-model` into a fixed cache dir; checksum files. Second run must not re-download/recompile. | Add caching/pinning; treat download as bootstrap, not per-run. |
+| S5 | **Streaming partials API exists** and accepts your buffer shape | Tiny file-stream spike → partial callbacks fire. | HUD partials become "deferred"; batch-only for v1. |
+| S6 | **Fn/Globe event semantics** on this hardware | `spikes/fnprobe.swift`: a listen-only tap printing `type/keycode/flags` for Fn, Fn+Space, L-Opt+Space, R-Opt+Space. | Fix §4 to match observed flags/keycodes. |
+| S7 | **Fn+Space is swallowable** before macOS acts on it | Swallow probe returns `nil` on Fn+Space; focus TextEdit, press it → no space, no input-source switch, no emoji panel. | Fn+Space is not a safe default; ship a different production hotkey. |
+| S8 | **`open` does NOT pass env vars** to the app | `MURMUR_TRIGGER=x open -na Murmur.app` then inspect the process env. | Confirmed-failing → launch the bundle exec directly or write config to disk (the spec assumes this; see §10.2). |
+| S9 | **Automation TCC blocks AppleScript readback** | `osascript -e 'tell application "TextEdit" to get name of document 1'` → expect prompt / `-1743`. | Confirms why v2 uses `InsertionProbe.app` instead (§10.5). |
+| S10 | **PPPC profile install** works on this machine | `sudo profiles install …`; query TCC.db for the grants. | If it fails (unmanaged Mac), permissions must be granted by a human once at bootstrap (§10.1). |
+| S11 | **Self-signed cert keeps the designated requirement stable** across rebuilds | `codesign -d -r-` before/after a rebuild+resign; `diff`. | TCC grants won't persist; fix cert/bundle-id stability (§9). |
+| S12 | **Killed-writer CAF is recoverable** | Recorder-probe writes CAF; `kill -9` mid-write; `afinfo`/`afconvert` the partial file. | Crash-safety story needs redesign (§5.3). |
+| S13 | **Tests run in a real GUI session** (+ Secure Input off) | `launchctl print gui/$UID`; check `IOHIDSystem` `SecureInput`. | Event taps / posting will misbehave; fix the environment, not the app. |
+
+S1–S3 and S6–S9 are the highest-value; do them first. The spike sources live in `spikes/` and are
+throwaway — none ship in the app.
 
 ---
 
 ## 1. Scope
 
 ### Must have (the whole product)
-1. **Local transcription with Parakeet**, default model `parakeet-tdt-0.6b-v2` (English). No
-   audio ever leaves the machine.
-2. **No cleanup step in the default config.** The raw Parakeet transcript is what gets
-   inserted. No LLM/prompt-dictation pass. (A cleanup hook may exist in code but is **off**
-   and unconfigured by default — see [§8.3](#83-no-cleanup-by-default).)
-3. **Hotkey trigger: `Fn`+`Space`.** Configurable. Ships with a **dev-override** hotkey so the
-   implementing agent can test while WisprFlow still owns `Fn` (see [§4](#4-hotkey-engine)).
-4. **Reliable audio persistence with retry.** Every recording is written to disk in a
-   crash-safe format *before and during* transcription, so a failed/crashed transcription can
-   always be retried from the saved audio (see [§7](#7-sessions-persistence--retry)).
-5. **Live transcript display** while speaking — a floating pill near the cursor showing the
-   streaming partial transcript, the way FluidVoice does (see [§6](#6-live-transcript-hud)).
+1. **Local transcription with Parakeet**, model `parakeet-tdt-0.6b-v2` (English) — the only model
+   in v1. No audio leaves the machine.
+2. **No cleanup step by default.** The raw Parakeet transcript is inserted. No LLM/prompt pass. A
+   `TranscriptProcessor` seam exists but ships as a no-op ([§8.3](#83-no-cleanup-by-default)).
+3. **Hotkey trigger.** Production default `Fn`+`Space` **pending S6/S7**; a preset non-Fn hotkey
+   (`Ctrl`+`Space`) is the fallback and the value used in all testing ([§4](#4-hotkey-engine)).
+   Preset triggers only — no custom-recorder UI, no modifier-alone triggers, no hold-to-talk in v1.
+4. **Reliable audio persistence with retry.** Every recording is written to an authoritative
+   capture artifact during recording, so a failed/crashed transcription retries from saved audio,
+   including a crash *mid-recording* ([§7](#7-sessions-persistence--retry)).
+5. **Live transcript display** while speaking — a floating pill near the cursor showing streaming
+   partials, FluidVoice-style. **Best-effort:** partials drive the HUD only; the text actually
+   inserted always comes from the authoritative batch pass ([§6](#6-live-transcript-hud),
+   [§8.2](#82-transcription-passes)).
 
 ### Explicitly out of scope (keep it minimal)
-- Transcript cleanup / LLM enhancement / custom vocabulary UI. (Leave a seam, ship it off.)
-- Multiple simultaneous models, model marketplace, cloud transcription providers.
-- History browser, analytics, onboarding wizard beyond the minimum permission flow.
-- Windows/Intel support. **Apple Silicon only.**
-- Notarization / App Store / signed distribution. This is a personal app; ad-hoc/self-signed
-  is fine ([§9](#9-build-sign-run)).
+- Transcript cleanup / LLM enhancement / custom vocabulary.
+- Multilingual (`v3`), model switching, cloud providers, Parakeet Flash.
+- Custom-hotkey recorder, hold-to-talk, modifier-alone triggers.
+- Secure input / password fields (explicitly **unsupported** — [§8.4](#84-text-insertion)).
+- History browser, analytics, onboarding beyond the minimum permission flow.
+- Windows/Intel. **Apple Silicon only.** Notarization / App Store (ad-hoc/self-signed is fine).
 
-If a feature isn't in "Must have," don't build it. Prefer a smaller app that is rock-solid on
-the five things above.
+If a feature isn't in "Must have," don't build it. A smaller app that nails the five is the goal.
 
 ---
 
@@ -49,473 +84,443 @@ the five things above.
 | Concern | Decision |
 |---|---|
 | Platform | macOS 14.0+ (Sonoma), Apple Silicon only |
-| Language | Swift 6, SwiftUI + AppKit (menu bar via `MenuBarExtra`, HUD via `NSPanel`) |
-| Build | Swift Package Manager, driven from CLI (`swift build`). An Xcode project is optional; **CI/agent testing must work from `swift build` + a bundling script** — do not require the Xcode GUI. |
-| Transcription | [`FluidAudio`](https://github.com/FluidInference/FluidAudio) (Apache-2.0) — Parakeet compiled to CoreML, runs on the Apple Neural Engine. **No Python.** |
-| Model | `parakeet-tdt-0.6b-v2` (English) default; `-v3` (multilingual, 25 langs) selectable. Downloaded at first run, not bundled. CC-BY-4.0 (attribution required). |
-| Sandbox | **Off.** Event taps + keystroke synthesis + global hotkey are impossible under App Sandbox. Hardened Runtime on, with mic + JIT-free entitlements. |
+| Language | Swift 6, SwiftUI + AppKit (menu bar `MenuBarExtra`, HUD `NSPanel`) |
+| Bundle id | **`com.alejoacelas.murmur`** — fixed. Never let the agent invent one; PPPC/TCC/DR all key on it. |
+| Packaging | A **`MurmurKit` library** target holds all logic. Thin executables link it: **`Murmur.app`** (GUI), **`murmurctl`** (CLI client), **`InsertionProbe.app`** (test target, [§10.5](#105-end-to-end-via-the-control-socket)). No dual-mode GUI/CLI binary. |
+| Build | SwiftPM from CLI (`swift build`) + a bundling script. **Never require the Xcode GUI.** |
+| Transcription | [`FluidAudio`](https://github.com/FluidInference/FluidAudio) — Parakeet on the Apple Neural Engine (CoreML). **No Python.** Hidden behind a `TranscriptionBackend` protocol ([§8.1](#81-transcription-backend)). |
+| Model | `parakeet-tdt-0.6b-v2` (English). Downloaded at first run to a configurable cache dir. CC-BY-4.0 (attribution required). |
+| Sandbox | **Off.** Event taps + keystroke synthesis + global hotkey are impossible sandboxed. Hardened Runtime on, mic entitlement, no JIT. |
 
-### Why this stack
-FluidVoice — the closest reference app — is pure Swift on a fork of FluidAudio (CoreML), with
-Whisper as a secondary backend. We copy that spine minus everything optional. The upstream
-public `FluidAudio` API is sufficient; no fork needed. Reference implementations to crib from:
-- [FluidVoice](https://github.com/altic-dev/FluidVoice) — Swift, FluidAudio, dual streaming+final managers.
-- [MacParakeet](https://github.com/moona3k/macparakeet) — smaller open Mac dictation app on FluidAudio CoreML.
-
-### Dependencies (`Package.swift`)
+### Dependencies — pin FluidAudio exactly
 ```swift
 dependencies: [
-    .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.12.4"),
-    // Swift-argument-parser for the CLI subcommands (§10.2). No other runtime deps.
+    // EXACT pin: pre-1.0 packages break API across 0.x; an autonomous build must be reproducible.
+    // Bump deliberately, re-run the §0 spikes, never float with `from:`.
+    .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.12.4"),
     .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.4.0"),
 ]
 ```
-Keep the dependency list this short. Everything else is system frameworks (AVFoundation,
-CoreGraphics, AppKit, SwiftUI, Carbon for key codes).
+Everything else is system frameworks (AVFoundation, CoreGraphics, AppKit, SwiftUI, Carbon key codes).
+
+### Configurable paths (no hardcoded `~/Library/...`)
+All state lives under a **single root** resolved from `$MURMUR_HOME`, else
+`~/Library/Application Support/Murmur/`. The root contains `recordings/`, `logs/`, `models/`
+(model cache; also honor FluidAudio's cache override), `control.sock`, `config.json`. **Tests set
+`MURMUR_HOME` to a fresh temp dir per run** so runs never pollute each other. The socket path and
+model-cache path are independently overridable (`$MURMUR_SOCK`, `$MURMUR_MODEL_CACHE`).
+
+### Why this stack
+FluidVoice — the closest reference — is pure Swift on a fork of FluidAudio (CoreML). We copy that
+spine minus everything optional; upstream's public API suffices (verify in S1–S3). Batch/final is
+the **authoritative** path; streaming partials are a best-effort HUD nicety. Cribbing references:
+[FluidVoice](https://github.com/altic-dev/FluidVoice), [MacParakeet](https://github.com/moona3k/macparakeet).
 
 ---
 
 ## 3. Architecture
 
 ```
-                         ┌──────────────────────────────────────────┐
-   Fn+Space  ───────────▶│  HotkeyEngine  (CGEventTap)              │
-   (or dev override)      └───────────────┬──────────────────────────┘
-                                          │ start()/stop()
-                                          ▼
-   ┌────────────┐   16kHz mono buffers   ┌──────────────┐   partials   ┌───────────────┐
-   │ AudioSource│──────────────────────▶│ Recorder      │─────────────▶│ Transcription  │
-   │  Mic│File  │   (also written to     │ (CAF on disk) │              │ Engine         │
-   └────────────┘    disk continuously)  └──────┬───────┘  final audio  │ (FluidAudio)   │
-                                                │                        └──────┬────────┘
-                                                ▼                                │
-                                        ┌───────────────┐   partial text  ┌──────▼──────┐
-                                        │ SessionStore   │◀───────────────│ TranscriptHUD│
-                                        │ (dir + meta)   │                │ (NSPanel)    │
-                                        └──────┬─────────┘  final text     └─────────────┘
-                                               │                                 │
-                                               │            final text           ▼
-                                               │                          ┌──────────────┐
-                                               └─────────────────────────▶│ TextInserter │
-                                                                          │ (paste Cmd-V)│
-                                                                          └──────────────┘
+   Ctrl+Space (test)         ┌──────────────────────────────┐
+   Fn+Space (prod, S6/S7)───▶│ HotkeyEngine (CGEventTap)     │ latched-modifier + exact match
+                             └──────────────┬───────────────┘ swallow both keyDown & keyUp
+                                            │ start()/stop()
+   ┌───────────────────┐  canonical 16k     ▼
+   │ AudioSource        │  mono Float32   ┌──────────────────────────────────────────┐
+   │  Mic  │  File       │───enqueue────▶ │ CaptureWorker (serial actor / ring buffer)│
+   └───────────────────┘  (copy only)     │  • append to authoritative capture file   │
+        both emit the                     │  • feed streaming transcriber (best-effort)│
+        SAME canonical PCM                └──────────────┬────────────────────────────┘
+                                                         │ EOF on stop() (async, drained)
+                                          ┌──────────────▼───────────────┐
+                                          │ SessionStore (dir + meta.json)│  state machine (§7)
+                                          └──────────────┬───────────────┘
+                          batch pass over authoritative audio (§8.2)
+                                          ┌──────────────▼───────────────┐   VAD gate (§5.4)
+                                          │ TranscriptionBackend          │──▶ final text
+                                          │  (FluidAudio, batch=truth)    │
+                                          └──────────────┬───────────────┘
+                        focus captured at START (§8.4)   │
+                                          ┌──────────────▼───────────────┐
+                                          │ TextInserter (paste, focus-   │
+                                          │  rechecked; typing fallback)  │
+                                          └───────────────────────────────┘
 
-   ┌─────────────┐    control commands (start/stop/inject/retry/status/last-transcript)
-   │ControlServer│◀──── Unix domain socket ────  murmurctl CLI  ◀──── autonomous test harness
-   └─────────────┘
-   ┌─────────────┐
-   │ MenuBarUI   │  status icon, Start/Stop, Retry failed, Settings, Quit
-   └─────────────┘
+   ControlServer (unix socket) ◀── murmurctl ◀── test harness   |   MenuBarUI + TranscriptHUD
 ```
 
-**Central state machine** (`AppModel`, `@MainActor`): `idle → recording → transcribing →
-(inserting) → idle`, with `transcribing → failed` on error. Every transition is logged as a
-structured JSON line (see [§10.4](#104-observability)) and reflected in the menu bar icon and
-`SessionStore`. Exactly one active session at a time; a second start while non-idle is ignored
-(and logged).
+### State ownership & concurrency (the v1 race fixes)
+- **`AppModel` (`@MainActor`) owns *state only*** — the enum, the current session id, UI. It never
+  touches audio buffers or files.
+- **The audio tap callback does the minimum: copy the buffer and enqueue it.** No conversion, file
+  I/O, logging, or inference in the tap — those cause dropped audio / tap-disable / deadlocks. A
+  dedicated **`CaptureWorker`** (serial `actor` or a serial queue draining a ring buffer) does
+  conversion, disk append, and streamer feed.
+- **Async boundaries are explicit:** `startRecording()`, `stopRecordingAndFinalize() async` (returns
+  only after the source has stopped, the pipeline has drained, and the capture file is closed),
+  `transcribeFinalized() async`, `insert() async`. State flips on the main actor *after* the data
+  step it represents has completed.
 
-**The `AudioSource` protocol is the single most important design seam.** The mic and a
-file-injection source are interchangeable behind it, so the entire record→transcribe→insert
-path can be exercised deterministically with a known WAV. Never read the mic directly outside
-`MicAudioSource`.
+### The `AudioSource` seam (most important design decision)
+Mic and file injection are interchangeable, so the whole path is deterministic with a known WAV.
+Both sources emit the **same canonical format** — 16 kHz mono **Float32** PCM — so nothing
+downstream can tell mic from file. **Resampling happens inside `MicAudioSource`, not in the
+recorder.** `stop()` is **async / signals EOF** so callers know no more buffers will arrive.
 
 ```swift
 protocol AudioSource {
-    /// Emits 16 kHz mono Float PCM frames until `stop()`. Called on an audio thread.
+    /// Emits canonical 16 kHz mono Float32 PCM until EOF. Buffers are delivered off the main actor.
     func start(onBuffer: @escaping (AVAudioPCMBuffer) -> Void) throws
-    func stop()
+    /// Returns after the last buffer has been delivered (source fully drained).
+    func stop() async
 }
 ```
+`FileAudioSource` replays a WAV's frames through the identical enqueue path; `MicAudioSource` owns
+`AVAudioEngine` + the hardware tap + the `AVAudioConverter` to canonical format.
 
 ---
 
 ## 4. Hotkey engine
 
-The `Fn` (Globe) key **cannot** be bound with Carbon `RegisterEventHotKey` — the Fn/secondary
-flag exists only in the CoreGraphics HID flag space. The only viable mechanism is a
-**`CGEventTap`**. This requires the **Input Monitoring** permission ([§8](#86-permissions)).
+`Fn` (Globe) **cannot** be bound via Carbon `RegisterEventHotKey` (the Fn/secondary flag lives only
+in CoreGraphics HID flags). The only mechanism is a **`CGEventTap`**, which needs **Input
+Monitoring** ([§8.6](#86-permissions)).
 
-### 4.1 Behavior
-- **Default trigger: `Fn`+`Space`, toggle mode** — tap once to start, tap again to stop. Toggle
-  (not hold-to-talk) is the default because it lets you step away from the keyboard during long
-  dictations. Hold-to-talk is a setting.
-- The trigger event is **swallowed** (tap uses `.defaultTap`, returns `nil` for the match) so no
-  literal space is typed into the focused app.
-- A **dev-override** trigger is selectable via config/env so the app can be developed and tested
-  while WisprFlow still owns `Fn`. Default dev override: **Right-Option (`⌥`) + `Space`**.
+### 4.1 Triggers (presets only in v1)
+- **Testing + fallback default: `Ctrl`+`Space`, toggle mode** — non-Fn, deterministic, unaffected
+  by Wispr Flow owning `Fn`. **All automated tests use this.**
+- **Production default: `Fn`+`Space`, toggle** — *pending S6/S7 verification on the real hardware*.
+  If S7 shows macOS wins the Fn+Space chord (input-source/emoji), ship `Ctrl`+`Space` as the
+  production default too and note it.
+- Toggle only (tap on / tap off). No hold-to-talk, no modifier-alone, no custom recorder in v1.
 
-### 4.2 Configurable trigger
-```swift
-struct Trigger: Codable {
-    var usesFn: Bool                 // require the secondary-Fn flag
-    var modifierFlags: UInt64        // CGEventFlags rawValue, e.g. .maskAlternate
-    var keyCode: UInt16?             // kVK_Space = 49; nil = modifier-alone trigger
-    var mode: Mode                   // .toggle | .holdToTalk
-    enum Mode: String, Codable { case toggle, holdToTalk }
+Presets are selected by name from config or `$MURMUR_TRIGGER` (`ctrl-space` | `fn-space`). **Do not
+rely on `open` to pass `$MURMUR_TRIGGER`** (S8) — tests launch `Murmur.app/Contents/MacOS/Murmur`
+directly, or write `config.json` before launch.
 
-    static let fnSpace     = Trigger(usesFn: true,  modifierFlags: 0, keyCode: 49, mode: .toggle)
-    static let rOptSpace   = Trigger(usesFn: false, modifierFlags: CGEventFlags.maskAlternate.rawValue, keyCode: 49, mode: .toggle)
-    static let ctrlSpace   = Trigger(usesFn: false, modifierFlags: CGEventFlags.maskControl.rawValue,   keyCode: 49, mode: .toggle)
-}
-```
-Resolution order at launch: `MURMUR_TRIGGER` env var (`fn-space` | `ropt-space` | `ctrl-space`)
-→ `~/Library/Application Support/Murmur/config.json` → default `.fnSpace`. **The autonomous
-test harness sets `MURMUR_TRIGGER=ropt-space`** (and mostly drives via the control socket
-anyway, so it rarely depends on the physical hotkey).
+### 4.2 Matching rules (v1 correctness fixes)
+- **Match on latched physical-modifier state, not the triggering event's flags.** Track Fn/Ctrl
+  down/up from `flagsChanged` (+ keycode); a Space `keyDown` fires only when the latched required
+  modifier is currently held. (The Space event's own flags don't always carry the modifier bit.)
+- **Exact modifier match, not superset.** `Ctrl`+`Space` must *not* fire on `Cmd`+`Ctrl`+`Space`.
+  Normalize to the supported modifier subset and require equality.
+- **Swallow both `keyDown` and `keyUp`** of the trigger (return `nil` for each) so no stray space or
+  dangling key-up reaches the focused app.
+- Handle `.tapDisabledByTimeout` / `.tapDisabledByUserInput` by re-enabling the tap, or the OS
+  silently kills it under load.
+- `tapCreate` returning `nil` ⇒ Input Monitoring not granted; surface guidance ([§8.6](#86-permissions)) and log.
 
-Key codes: `kVK_Function=0x3F`, `kVK_Space=0x31 (49)`, `kVK_ANSI_V=0x09`, `kVK_RightOption=0x3D`.
-
-### 4.3 Implementation notes (from research, use verbatim as the base)
-- `CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
-  eventsOfInterest: keyDown|keyUp|flagsChanged, callback:, userInfo: self)`.
-- The callback is a bare C function pointer — pass `self` via `userInfo` and
-  `Unmanaged.fromOpaque`. No Swift closure capture.
-- Track `Fn` via `flagsChanged` where key code == `0x3F` and `flags.contains(.maskSecondaryFn)`;
-  down edge = flag now set, up edge = flag now clear.
-- `Fn`+`Space` = a `keyDown` for key code 49 while tracked `fnIsDown == true`.
-- **Handle `.tapDisabledByTimeout`/`.tapDisabledByUserInput` by re-enabling the tap**
-  (`CGEvent.tapEnable(tap:enable:true)`), or the OS silently kills it under load.
-- If `tapCreate` returns `nil`, treat it as "Input Monitoring not granted," surface the guidance
-  in [§8](#86-permissions), and log it.
-
-The full reference `HotkeyEngine` (with `flagsChanged` edge tracking, toggle vs hold logic, and
-tap re-enable) is in [Appendix A](#appendix-a-reference-hotkeyengine).
+Key codes: `kVK_Function=0x3F`, `kVK_Space=0x31 (49)`, `kVK_Control=0x3B`, `kVK_ANSI_V=0x09`.
+Factor the "does this event match?" decision into a **pure function** over (latched modifiers,
+event type, keycode) so it's unit-testable without a live tap ([§10.4](#104-test-layers) layer 3).
+Full reference in [Appendix A](#appendix-a-reference-hotkeyengine).
 
 ---
 
 ## 5. Audio capture
 
-### 5.1 Format
-Parakeet wants **16 kHz, mono, 16-bit PCM**. Capture at the hardware format (the input node tap
-*must* use the hardware format) and resample to 16 kHz mono with `AVAudioConverter`.
+### 5.1 Canonical format & ownership
+Everything downstream consumes **16 kHz mono Float32 PCM**. `MicAudioSource` captures at the
+hardware format (the input-node tap *must* use the hardware format) and resamples to canonical with
+`AVAudioConverter`. The `CaptureWorker` only ever sees canonical buffers; it does not resample.
 
-### 5.2 Engine
-Use **`AVAudioEngine`** with a tap on the input node (not `AVAudioRecorder` — we need live
-buffers to stream to both the transcriber and the disk file). Each converted buffer is:
-1. Handed to the streaming transcriber (partials).
-2. Appended to the on-disk recording file.
+### 5.2 Engine & real-time safety
+`AVAudioEngine` input-node tap. **The tap callback copies the buffer and enqueues it to the
+`CaptureWorker`; nothing else.** The worker (off the audio thread) converts if needed, appends to
+the capture file, and feeds the streaming transcriber.
 
-### 5.3 Crash-safe on-disk format — **CAF while recording, WAV at the end**
-A WAV/RIFF header stores total length up front, so a process that dies mid-recording leaves a
-WAV whose header lies about its length — often unreadable. **CAF (Core Audio Format) is designed
-for streaming and stays valid when truncated.** Therefore:
+### 5.3 Authoritative capture artifact & honest durability
+- **The authoritative recording is `audio.caf`** (Core Audio Format — designed for streaming, stays
+  valid when truncated, unlike a length-prefixed WAV header). Written continuously via
+  `AVAudioFile(forWriting:)`; each `write(from:)` appends.
+- **Durability claim, stated precisely:** `AVAudioFile.write` hands bytes to the OS, so audio
+  already written **survives a process crash / SIGKILL** (the case that matters for "retry if
+  transcription fails") — the OS retains the buffered writes. It is **not** a guarantee against
+  power loss. To narrow even that window, call `fsync` on a timer (~every 2 s) during recording.
+  **Verify real recoverability with S12** (kill a live writer, `afconvert` the partial), not by
+  assuming.
+- **`audio.wav` is a derived cache, not the source of truth.** On clean stop, transcode
+  `audio.caf → audio.wav` for convenience, but transcription and retry read the **authoritative
+  audio**, preferring `audio.caf`; `audio.wav` is optional. Don't oversell `replaceItemAt` as
+  crash-durable (with `AVAudioFile` you don't hold the FD, and a rename isn't dir-synced).
 
-- During recording, stream to `audio.caf` via `AVAudioFile(forWriting:)`. Each `write(from:)`
-  appends and flushes, so captured audio is on disk continuously.
-- On clean stop, transcode `audio.caf → audio.wav` **atomically**: write to a temp path, `fsync`
-  the handle, then `FileManager.replaceItemAt` to swap into place. Readers never see a partial
-  file.
-- **Keep `audio.caf` until transcription succeeds.** If the app crashes anywhere in the pipeline,
-  a valid CAF remains for retry ([§7](#7-sessions-persistence--retry)).
+### 5.4 Silence / hallucination gate
+Parakeet (like most ASR) **hallucinates on silence/noise**. Before the batch pass, compute RMS over
+the recording; if below a threshold (tune during testing), **produce no transcript and insert
+nothing** — don't feed near-silence to the model. `silence.wav` asserts this path
+([§10.3](#103-fixtures--assertions)).
 
-`wavSettings` and the reference `Recorder` (tap install, `AVAudioConverter` resample loop,
-atomic finalize) are in [Appendix B](#appendix-b-reference-recorder).
+`wavSettings` and the reference `CaptureWorker`/`Recorder` are in [Appendix B](#appendix-b-reference-capture).
 
 ---
 
 ## 6. Live transcript HUD
 
-Mirror FluidVoice's live preview with a minimal floating pill.
-
+Mirror FluidVoice's live preview with a minimal floating pill — but it is a **display nicety, not
+the source of inserted text**.
 - **Window:** borderless `.nonactivatingPanel` `NSPanel`, `level = .statusBar`,
   `ignoresMouseEvents = true`, `collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary,
-  .stationary]`, clear background, shadowed. Shown with `orderFrontRegardless()` so it never
-  steals focus from the app you're dictating into. Content is a SwiftUI view in an
-  `NSHostingView`.
-- **Placement:** just below the current mouse location (`NSEvent.mouseLocation`, minus ~60pt in
-  y). Good enough; do not attempt caret tracking (out of scope).
-- **Content / states:**
-  - `recording` — animated waveform/mic glyph + the **streaming partial transcript** text,
-    updated live as FluidAudio's streaming manager emits partials.
-  - `transcribing` — spinner + "Transcribing…" (the short final-pass gap after you stop).
-  - Auto-hide ~0.4s after text is inserted, or immediately on cancel.
-- The partial text comes from the **streaming** transcription manager; the text actually
-  inserted comes from the **final** pass ([§8.2](#82-streaming--final-two-pass)).
-
-Keep it small and legible; no settings for size/position in v1 (FluidVoice has notch/pill/large
-modes — out of scope).
+  .stationary]`, clear bg, shadow, shown via `orderFrontRegardless()` (never steals focus). SwiftUI
+  content in `NSHostingView`.
+- **Placement:** just below `NSEvent.mouseLocation`. No caret tracking (out of scope).
+- **States:** `recording` → animated glyph + streaming partial text; `transcribing` → spinner;
+  auto-hide ~0.4 s after insert or on cancel.
+- **Testability:** in debug builds, expose the HUD's current visibility and last partial via the
+  control API (`murmurctl hud`) so tests can assert it without a screen. If S5 shows streaming is
+  version-fragile, ship the HUD showing a "listening…" state without live partials and defer
+  partials — the app still meets must-have #5's intent minimally; note the downgrade.
 
 ---
 
 ## 7. Sessions, persistence & retry
 
-This is the reliability backbone. **Audio is sacred; a transcript can always be regenerated.**
+**Audio is sacred; a transcript can always be regenerated. Transcription failure ≠ insertion
+failure.**
 
 ### 7.1 Layout
-Each recording is a **session directory** under
-`~/Library/Application Support/Murmur/recordings/`:
+Session dir under `$MURMUR_HOME/recordings/<id>/`:
 ```
-recordings/
-  2026-07-04T18-22-05_3F2A9C/
-    audio.caf        # streaming-safe, written during recording
-    audio.wav        # finalized 16kHz mono, written on clean stop
-    meta.json        # session state machine + result
-    transcript.txt   # written on success
+audio.caf        # authoritative, written during recording
+audio.wav        # derived cache (optional, post-stop)
+meta.json        # state machine + result (written atomically on every change)
+transcript.txt   # written when transcription succeeds
 ```
-`meta.json`:
-```json
-{
-  "id": "2026-07-04T18-22-05_3F2A9C",
-  "createdAt": "2026-07-04T18:22:05Z",
-  "state": "recorded|transcribing|done|failed",
-  "model": "parakeet-tdt-0.6b-v2",
-  "durationSec": 7.4,
-  "attempts": 1,
-  "lastError": null,
-  "transcript": "…",            // mirror of transcript.txt on success
-  "insertedAt": "2026-07-04T18:22:13Z"
-}
-```
-Write `meta.json` atomically (temp + rename) on **every** state change.
 
-### 7.2 State machine & retry rules
-- `recording` ends → CAF finalized to WAV, `state = recorded`.
-- Transcription starts → `state = transcribing`, `attempts += 1`.
-- Success → write `transcript.txt`, `state = done`, insert text.
-- Failure (model error, crash caught, timeout) → `state = failed`, `lastError` set. **Do not
-  delete audio.**
-- **Automatic retry:** on failure, retry up to **2** more times immediately (total 3 attempts)
-  with a short backoff. If still failing, leave `failed` and surface "Retry failed transcription"
-  in the menu bar.
-- **Recovery on launch:** at startup, scan `recordings/` for any session in `recorded`,
-  `transcribing`, or `failed` (i.e. not `done`). Re-run transcription for each from its saved
-  audio. This is what makes "retry if something fails" hold across crashes and restarts.
-- **Manual retry:** menu item + `murmurctl retry <id>` re-runs a specific session.
+### 7.2 State machine (split states)
+```
+recording ─▶ recorded ─▶ transcribing ─▶ transcribed ─▶ inserting ─▶ inserted
+                │              │               │              │
+                ▼              ▼               │              ▼
+           (crash mid-    transcribeFailed     │        insertFailed
+            recording)      (transient|          └─────────────┐
+                             permanent)                        │
+                                                     (already have transcript;
+                                                      retry = re-insert, NOT re-transcribe)
+```
+`meta.json` records `state`, `attempts`, `failureClass` (`transient` | `permanent`), `lastError`,
+`model`, `durationSec`, timestamps, and (on success) `transcript`.
 
-### 7.3 Retention
-Default: **keep audio and transcript** after success (the user keeps recordings in their
-FluidVoice setup). Setting `retention`: `keep` (default) | `deleteOnSuccess`. Even with
-`deleteOnSuccess`, audio is kept while `state != done`. Optional cap: prune `done` sessions
-older than N days (default off).
+### 7.3 Retry & recovery rules
+- **Transient transcription failures** (model warm-up, transient I/O) → auto-retry up to 3 total
+  with backoff. **Permanent failures** (corrupt/empty audio, missing model, unsupported format) →
+  no auto-retry; menu shows "Retry" for a manual attempt. Classification is persisted so relaunch
+  doesn't thrash on a permanent failure.
+- **`insertFailed`** (target lost focus, paste blocked) → retry means **re-insert the existing
+  transcript**, never re-transcribe (re-transcribing could duplicate output). Re-check focus first.
+- **Crash-mid-recording recovery:** on launch, scan for sessions in `recording` older than a
+  staleness threshold, and orphan dirs that have `audio.caf` but incomplete `meta.json`. Finalize
+  their audio and transcribe. This is the case v1 missed.
+- **Launch recovery** re-runs only recoverable states (`recording`→finalize, `recorded`,
+  `transcribing`, `transcribed`→re-insert, transient `transcribeFailed`). Permanent failures wait
+  for manual retry.
+- **Manual retry:** menu item + `murmurctl retry <id>`.
+
+### 7.4 Retention
+Default **keep** audio + transcript after success. Setting `retention`: `keep` | `deleteOnSuccess`
+(even then, audio is kept while `state` isn't terminal-success). Optional age-based prune (default off).
 
 ---
 
-## 8. Transcription & config
+## 8. Transcription, insertion & config
 
-### 8.1 Model management
-- On first run, download the default model via `AsrModels.downloadAndLoad(version: .v2)` to
-  `AsrModels.defaultCacheDirectory(...)`. Show progress in the menu bar / a small window.
-- Load once at launch (or lazily on first record) and keep the `AsrManager` warm — model load is
-  the slow part; transcription itself is ~100–190× real-time on Apple Silicon.
-- Setting `model`: `parakeet-v2` (English, default) | `parakeet-v3` (multilingual). Maps to
-  FluidAudio `.v2` / `.v3`.
+### 8.1 Transcription backend
+Hide FluidAudio behind a protocol so an API change (or a swap to another engine) touches one file:
+```swift
+protocol TranscriptionBackend {
+    func ensureModelReady() async throws          // download+load (idempotent, cached)
+    func transcribe(_ samples: [Float]) async throws -> String   // batch/authoritative
+    // Optional streaming; nil if S5 not satisfied:
+    func makeStreamingSession() -> StreamingSession?
+}
+```
+`FluidAudioBackend` wraps `AsrModels.downloadAndLoad(version: .v2)` +
+`AsrManager(config: .default)` + `transcribe(...)` **using the exact signature discovered in S1–S3**
+(drop `source:` if upstream lacks it). Load once, keep warm.
 
-### 8.2 Streaming + final (two-pass)
-Follow FluidVoice's design: keep **two managers**.
-- **Streaming manager** (`SlidingWindowAsrManager` or streaming config) — fed live buffers during
-  recording, drives the HUD partials. Optimized for latency, not final accuracy.
-- **Final manager** (`AsrManager(config: .default)`) — on stop, transcribe the finalized WAV in
-  one pass for the **text that actually gets inserted**. Higher accuracy.
-
-If the two-manager setup proves fiddly for v1, an acceptable fallback is: stream partials for the
-HUD, but on stop **re-transcribe the whole WAV** with the batch manager for the inserted text.
-The inserted text must always come from a full-file pass over the saved audio, so it's identical
-to what a retry would produce.
+### 8.2 Transcription passes
+- **Batch pass = authoritative.** On stop, transcribe the full authoritative audio in one pass; its
+  output is the **only** text ever inserted. Identical to what a retry produces.
+- **Streaming = best-effort HUD only.** If S5 passes, feed live buffers to a `SlidingWindowAsrManager`
+  session for partials. **Single warm model where possible;** don't keep two heavyweight managers
+  resident if it doubles ANE/memory pressure (v1 risk) — prefer one batch manager plus a
+  short-lived/streaming session, or drop streaming to "listening…" per §6.
 
 ### 8.3 No cleanup by default
-The inserted text is the **raw Parakeet output** — Parakeet v2/v3 already emit punctuation and
-capitalization. There is **no** LLM/prompt pass in the default config. Implement a
-`TranscriptProcessor` protocol with a default `IdentityProcessor` (returns input unchanged) so a
-future cleanup step is a drop-in, but ship `IdentityProcessor` wired in and no cleanup config
-present. Do not add an Anthropic/OpenAI dependency.
+Inserted text is **raw Parakeet output** (it already emits punctuation/caps). Implement
+`TranscriptProcessor` with a wired-in `IdentityProcessor` (returns input unchanged). No LLM
+dependency, no cleanup config.
 
 ### 8.4 Text insertion
-- **Default: paste via synthesized `Cmd`+`V`.** Set `NSPasteboard` string, post `Cmd+V` via
-  `CGEvent`, then **restore the previous clipboard after ~150ms** (restoring synchronously races
-  the paste). Snapshot all pasteboard items to restore faithfully.
-- **Fallback (setting): type via `CGEventKeyboardSetUnicodeString`** for apps that block paste
-  (password fields, some VMs). Chunk the text (~20 chars) with tiny sleeps.
-- Both require **Accessibility** permission; without it `CGEvent.post` silently no-ops.
-- Reference code for both in [Appendix C](#appendix-c-reference-textinserter).
+- **Focus capture:** record the frontmost app / focused element **at recording start**. Before
+  inserting, **re-check focus**; if it changed (common in toggle mode), either target the captured
+  app or fail into `insertFailed` safely rather than pasting into the wrong place.
+- **Default: paste via synthesized `Cmd`+`V`.** Snapshot the pasteboard, set our string, post
+  `Cmd+V`, then **best-effort restore** the previous clipboard after a short, **configurable** delay
+  (`preserveClipboard`, default on). Restore is **lossy best-effort** — file promises / custom
+  providers don't round-trip via `NSPasteboardItem`; don't claim perfect fidelity. Consider trying
+  **AX (`AXUIElement`) insertion** first where available, paste as fallback.
+- **Event tap for posting:** probe both `.cgAnnotatedSessionEventTap` and `.cghidEventTap` on real
+  apps (S-style check) and standardize on whichever is accepted; keep it configurable for tests.
+- **Typing fallback** (`CGEventKeyboardSetUnicodeString`, ~20-char chunks): **ASCII-ish fallback
+  only**, fragile with IMEs/emoji/dead-keys; not a "reliable" primary path.
+- **Secure input / password fields are unsupported in v1** — Secure Input can block taps, paste, and
+  typing wholesale. Detect and no-op with a logged reason.
 
-### 8.5 Config file
-`~/Library/Application Support/Murmur/config.json`, all optional with the defaults above:
+### 8.5 Config (`$MURMUR_HOME/config.json`, all optional)
 ```json
 {
-  "trigger": "fn-space",          // fn-space | ropt-space | ctrl-space | {custom struct}
-  "triggerMode": "toggle",        // toggle | holdToTalk
-  "model": "parakeet-v2",         // parakeet-v2 | parakeet-v3
+  "trigger": "ctrl-space",        // ctrl-space | fn-space  (presets only)
+  "model": "parakeet-v2",         // v1: parakeet-v2 only
   "insertion": "paste",           // paste | type
+  "preserveClipboard": true,
   "retention": "keep"             // keep | deleteOnSuccess
 }
 ```
 
----
-
 ### 8.6 Permissions
+Three **distinct** TCC grants, **gated by feature** — the app is *not* "useless without all three":
+file-transcribe needs none; the record path needs Microphone; insertion needs Accessibility; the
+hotkey needs Input Monitoring. A status window lists live green/red state + "Open Settings".
 
-Three **distinct** TCC grants. Detect → request → guide the user (deep-link to the exact
-Settings pane). The app is useless without all three; show a single status window listing them
-with live green/red state and "Open Settings" buttons.
-
-| Permission | Why | API to detect / request |
+| Permission | Needed for | Detect / request |
 |---|---|---|
-| **Microphone** | record audio | `AVCaptureDevice.authorizationStatus(for:.audio)` / `requestAccess`. Needs `NSMicrophoneUsageDescription` in Info.plist. |
-| **Input Monitoring** | the *listening* CGEventTap | `CGPreflightListenEventAccess()` / `CGRequestListenEventAccess()`. If `tapCreate` returns nil → this is missing. |
-| **Accessibility** | *posting* keystrokes (paste/type) | `AXIsProcessTrustedWithOptions(prompt:true)`. |
+| **Microphone** | mic recording | `AVCaptureDevice.authorizationStatus(for:.audio)` / `requestAccess`. `NSMicrophoneUsageDescription` in Info.plist. |
+| **Input Monitoring** | the listening `CGEventTap` | `CGPreflightListenEventAccess()` / `CGRequestListenEventAccess()`. `tapCreate == nil` ⇒ missing. |
+| **Accessibility** | posting keystrokes (paste/type) | `AXIsProcessTrustedWithOptions(prompt:true)`. |
 
-Deep links:
-`x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone` /
-`?Privacy_ListenEvent` / `?Privacy_Accessibility`.
-
-> After granting Accessibility / Input Monitoring, macOS often requires an **app relaunch** for
-> the running process to see the grant. Detect the flip and prompt to restart.
-
-Ad-hoc rebuilds change the signature and can re-trigger prompts every build. Fix by using a
-**stable self-signed identity** so TCC grants persist across rebuilds — see
-[§9](#9-build-sign-run) and [§10.1](#101-permission-automation).
+Deep links: `x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone` /
+`?Privacy_ListenEvent` / `?Privacy_Accessibility`. After a grant, macOS often needs an **app
+relaunch** to see it — detect the flip and prompt to restart. Permission *provisioning* is
+**bootstrap, not per-test-run** ([§10.1](#101-permissions-are-bootstrap-not-per-run)).
 
 ---
 
 ## 9. Build, sign, run
 
-- **No sandbox.** `com.apple.security.app-sandbox = false`. Hardened Runtime on with
+- **No sandbox.** `app-sandbox = false`; Hardened Runtime on with
   `com.apple.security.device.audio-input = true`.
-- Build headless: `swift build -c release`, then a `scripts/bundle.sh` assembles `Murmur.app`
-  (Info.plist with `LSUIElement = true` for no Dock icon, the binary, entitlements) and
-  **codesigns with a stable local identity** (see below). No notarization.
-- **Stable self-signed cert (do this once on the test Mac):** create a self-signed code-signing
-  certificate in the login keychain named e.g. `Murmur Dev` so the bundle's designated
-  requirement is constant across rebuilds and **TCC grants stick**. `scripts/make-cert.sh`
-  automates it (`security create-keychain` / a `certtool`/`openssl`+`security import` flow, or a
-  documented Keychain Access step). Falling back to ad-hoc (`--sign -`) works but re-prompts for
-  permissions on every rebuild — acceptable only if [§10.1](#101-permission-automation)
-  re-grants each build.
+- Build headless: `swift build -c release`; `scripts/bundle.sh` assembles `Murmur.app` (Info.plist
+  `LSUIElement = true` → no Dock icon; fixed bundle id `com.alejoacelas.murmur`) and **codesigns
+  with a stable self-signed identity** so the **designated requirement is constant across rebuilds
+  and TCC grants persist**. No notarization.
+- **`scripts/make-cert.sh` (one-time):** create a self-signed code-signing cert (fixed subject) in a
+  keychain, and **set the key partition list / keychain ACLs** so `codesign` won't block on prompts
+  during automated rebuilds. **Verify stability with S11** (`codesign -d -r-` diff across rebuilds),
+  not just "codesign succeeded". Recreating the cert breaks persistence — treat it as durable infra.
 - Sign: `codesign --force --options runtime --entitlements Murmur.entitlements --sign "Murmur Dev" Murmur.app`.
-- If Gatekeeper quarantines a copied build: `xattr -dr com.apple.quarantine Murmur.app`.
+- **Launch for tests by exec, not `open`** (S8): `Murmur.app/Contents/MacOS/Murmur` so env
+  (`MURMUR_HOME`, `MURMUR_TRIGGER`) is inherited. If Gatekeeper quarantines a copy:
+  `xattr -dr com.apple.quarantine Murmur.app`.
 
-`scripts/` to provide: `bundle.sh`, `make-cert.sh`, `grant-permissions.sh`,
-`reset-permissions.sh`, `run.sh` (build → bundle → sign → launch).
+`scripts/`: `bundle.sh`, `make-cert.sh`, `grant-permissions.sh`, `reset-permissions.sh`, `run.sh`,
+`test.sh`, `preflight.sh` ([§10.6](#106-one-command-harness--acceptance)).
 
 ---
 
 ## 10. Autonomous testing
 
-**The whole point: a coding agent on a different Mac, with full admin/permissions, builds this
-and drives it to reliability without a human ever clicking anything or speaking into a mic.**
-Every requirement below exists to make that possible. Build these seams *first*.
+**A coding agent on a Mac with full permissions builds this and drives it to reliability with no
+human clicking or speaking.** These seams come *first*, before UI. Design changed from v1 in two big
+ways: a **purpose-built insertion probe** (no AppleScript/TextEdit), and **permissions treated as
+environment bootstrap** rather than something the test loop conjures.
 
-### 10.1 Permission automation
-The test Mac has full permissions and (for the deepest automation) may have **SIP disabled in a
-disposable VM/box**. Provide:
-- `scripts/grant-permissions.sh` — grants Microphone, Input Monitoring, Accessibility to the
-  Murmur bundle id. Two supported mechanisms, pick per environment:
-  1. **PPPC configuration profile** (`assets/murmur.pppc.mobileconfig`, no SIP change) installed
-     via `profiles install` / MDM — the sanctioned path. Payload authorizes
-     `kTCCServiceAccessibility`, `kTCCServiceListenEvent`, `kTCCServiceMicrophone` for the
-     bundle id + its (stable self-signed) code requirement.
-  2. **Direct TCC.db writes** for a SIP-disabled test box (`auth_value=2` rows for the three
-     services), wrapping a maintained tool (`tccplus` / `DocSystem/tccutil`). Document the raw
-     SQL as a fallback but prefer the tool since the schema drifts across macOS versions.
-- `scripts/reset-permissions.sh` — `tccutil reset {Microphone,Accessibility,ListenEvent} <bundleid>`
-  for a clean-slate test run.
-- **Use the stable self-signed identity** ([§9](#9-build-sign-run)) so one grant survives all
-  rebuilds within a test session.
-
-The harness must **verify** grants after granting (don't assume): the app exposes
-`murmurctl permissions` returning the three booleans (from the same detect APIs in
-[§8](#86-permissions)); the harness asserts all true before running functional tests.
+### 10.1 Permissions are bootstrap, not per-run
+Grant the three services **once** to the fixed bundle id on a **pre-provisioned machine/VM image**,
+then reuse it across runs. The test loop *validates* (`murmurctl permissions` → asserts), it does
+not try to grant on an arbitrary Mac.
+- Preferred: **PPPC configuration profile** (`assets/murmur.pppc.mobileconfig`) — reliably unattended
+  only on **MDM/UAMDM-managed** machines (verify with S10). On an unmanaged Mac, a human grants the
+  three toggles once at setup (this is the one upfront human step; flag it).
+- Lab-only fallback: **direct TCC.db writes** on a **disposable SIP-disabled** box (schema/tool
+  drift; restart `tccd`). Not a portable path — last resort.
+- `scripts/reset-permissions.sh` = `tccutil reset {Microphone,Accessibility,ListenEvent} com.alejoacelas.murmur`
+  for a clean slate. The **stable cert** (§9) keeps grants across rebuilds within a session.
 
 ### 10.2 Control interface — the automation seam
-The app runs a **local control server** on a Unix domain socket at
-`~/Library/Application Support/Murmur/control.sock` (only present when the app is running). A CLI
-target **`murmurctl`** (built from the same package, swift-argument-parser) sends line-delimited
-JSON requests and prints JSON responses. This lets the harness drive the app with **no synthetic
-keyboard events and no live microphone**.
+`Murmur.app` runs a **Unix-domain control server** at `$MURMUR_SOCK`
+(default `$MURMUR_HOME/control.sock`). **`murmurctl`** sends line-delimited JSON and prints JSON.
+This drives the app with **no synthetic keys and no live mic**. Expanded from v1 with readiness,
+model, deterministic waits, and fault injection so the harness never `sleep`s blindly:
 
-Commands (all also usable by a human for debugging):
+| Command | Effect / returns |
+|---|---|
+| `murmurctl health` | `{ready, guiSession, permissions:{mic,input,ax}, model:{state}}` — one-shot readiness |
+| `murmurctl wait-ready [--timeout s]` | blocks until app is up + model ready |
+| `murmurctl await-state <state> [--timeout s]` | blocks until the state machine reaches `<state>` (deterministic, no sleeps) |
+| `murmurctl model status` / `model ensure` | report / trigger idempotent model download+load |
+| `murmurctl permissions` | `{microphone,inputMonitoring,accessibility}` |
+| `murmurctl start` / `stop` | begin / stop recording from the current source |
+| `murmurctl inject <wav>` | one-shot record→transcribe→insert using `<wav>` as source; `{sessionId,transcript}` |
+| `murmurctl transcribe <wav>` | headless: transcribe a file, return text (no HUD/insert/session) |
+| `murmurctl retry <id>` | re-run a session per its state (re-transcribe or re-insert) |
+| `murmurctl last` / `sessions` | session meta / list |
+| `murmurctl hud` | (debug) `{visible, lastPartial}` — lets tests assert the HUD |
+| `murmurctl quit` | clean shutdown |
+| `murmurctl fault <kind> <value>` | (debug) inject faults: `transcribe-delay-ms`, `fail-transcribe`, `fail-insert` — makes race tests deterministic |
 
-| Command | Effect | Returns |
-|---|---|---|
-| `murmurctl status` | current state machine state, active session id | `{state, sessionId}` |
-| `murmurctl permissions` | TCC status | `{microphone, inputMonitoring, accessibility}` |
-| `murmurctl start` | begin recording from the **current audio source** | `{sessionId}` |
-| `murmurctl stop` | stop recording, run transcription, insert | `{sessionId, transcript}` |
-| `murmurctl inject <wav>` | **one-shot**: run the full record→transcribe→insert path using `<wav>` as the audio source instead of the mic | `{sessionId, transcript}` |
-| `murmurctl transcribe <wav>` | **headless**: transcribe a file and return text, no HUD/insert/session | `{transcript}` |
-| `murmurctl retry <id>` | re-transcribe a saved session from its audio | `{transcript}` |
-| `murmurctl last` | last session's meta.json | `{...meta}` |
-| `murmurctl sessions` | list recent sessions + states | `[{id,state,...}]` |
+`inject` (FileAudioSource) is the e2e workhorse; `transcribe` is the zero-permission backend check.
+The **`murmur-smoke`** executable also transcribes a fixture with no GUI/permissions for the earliest
+milestone.
 
-`inject` is the workhorse for end-to-end tests: it swaps a `FileAudioSource` (which replays the
-WAV through the exact same `AudioSource` → `Recorder` → transcription path the mic uses) so the
-output is **deterministic** for a fixed input WAV. `transcribe` is the fast path for unit-testing
-the model with zero permissions.
+### 10.3 Fixtures & assertions
+Commit **fixed** WAVs under `Tests/Fixtures/` (16 kHz mono; **do not regenerate in the loop** — `say`
+voices drift across macOS versions):
+- `hello_world.wav`, `the_quick_brown_fox.wav`, `numbers.wav` (short), `silence.wav`, `long_60s.wav`.
+- `scripts/make-fixtures.sh` regenerates them *offline* when deliberately refreshing, via
+  `say … | afconvert -f WAVE -d LEI16@16000 -c 1`.
 
-> A `murmur transcribe <wav>` **headless subcommand of the app binary itself** (not via socket)
-> must also exist, so the transcription backend can be tested before any GUI/permission work.
+**Assertion policy (WER on tiny clips is meaningless — one wrong word in "hello world" is WER 0.5):**
+- **Short clips** → **exact normalized match** (lowercase, strip punctuation, collapse whitespace).
+- **`long_60s.wav`** → **WER/CER ≤ threshold** (e.g. WER ≤ 0.1).
+- **`silence.wav`** → empty output (VAD gate, §5.4).
 
-### 10.3 Test audio fixtures
-Commit small fixtures under `Tests/Fixtures/` (all 16 kHz mono WAV, a few seconds each):
-- `hello_world.wav` → expected ≈ `"hello world"` (short sanity).
-- `the_quick_brown_fox.wav` → a known pangram-ish sentence.
-- `numbers.wav` → e.g. `"testing one two three"`.
-- `silence.wav` → expected empty / whitespace transcript.
-- `long_60s.wav` → a ~60s clip to exercise chunking + timing.
+### 10.4 Test layers
+1. **Backend unit** (no permissions, `murmur-smoke`/`murmurctl transcribe`): fixtures → §10.3 policy.
+   Depends on S1–S4. Iterate here until green before any GUI.
+2. **Persistence/retry unit:** create sessions; use `fault fail-transcribe` / `transcribe-delay-ms`
+   to force paths; assert audio survives, crash-mid-recording recovery finalizes+transcribes,
+   transient vs permanent classification, `transcribed`→re-insert (not re-transcribe). Recovery test
+   kills a **real writer process** (S12), not a synthetic truncation.
+3. **Hotkey logic unit:** call the pure match function with synthetic (latched-modifier, type,
+   keycode) sequences for Ctrl+Space and Fn+Space; assert start/stop and exact-match rejection of
+   `Cmd+Ctrl+Space`. (Live tap needs Input Monitoring; keep matching pure.)
+4. **End-to-end via control socket** (needs the granted permissions + GUI session) — see §10.5.
+5. **Clipboard-restore:** sentinel on clipboard → `inject` → assert restored (best-effort; documented).
+6. **Real-hotkey smoke (optional, non-blocking):** post synthetic `Ctrl`+`Space` via `CGEvent`, assert
+   recording starts — exercises the tap itself; may be flaky headless.
 
-Generate them **without a human voice** so tests are reproducible and CI-portable:
-- Preferred: macOS `say` piped to the right format —
-  `say "hello world" -o /tmp/h.aiff && afconvert -f WAVE -d LEI16@16000 -c 1 /tmp/h.aiff hello_world.wav`.
-  `say` output is clean TTS that Parakeet transcribes reliably, giving stable expected strings.
-- A `scripts/make-fixtures.sh` regenerates them so they're not opaque binaries.
+### 10.5 End-to-end via the control socket
+No AppleScript, no TextEdit (that adds a **fourth** TCC domain — Automation/AppleEvents — and
+first-run/focus flakiness; see S9). Instead ship **`InsertionProbe.app`**: a tiny target with a
+focused `NSTextView` that **reports its own text back over the control socket / a file**. The e2e:
+1. Launch `Murmur.app` by exec with `MURMUR_HOME=<temp>` `MURMUR_TRIGGER=ctrl-space`.
+2. `murmurctl wait-ready`; `murmurctl permissions` → assert all true; `preflight.sh` asserts GUI session.
+3. Launch `InsertionProbe.app`, focus its text view.
+4. `murmurctl inject Tests/Fixtures/hello_world.wav`; `murmurctl await-state inserted`.
+5. Read the probe's text via its readback; assert it matches (§10.3). No mic, no human, deterministic.
 
-Assertions use **normalized comparison** (lowercase, strip punctuation, collapse whitespace) and,
-where exactness is unrealistic, a **word-error-rate threshold** (e.g. WER ≤ 0.1) rather than
-string equality — TTS + ASR isn't bit-exact. `silence.wav` asserts empty output.
-
-### 10.4 Observability
-- **Structured JSON logs** to `~/Library/Application Support/Murmur/logs/murmur.log`, one object
-  per line: `{ts, level, event, sessionId, state, msg, ...}`. Every state transition, permission
-  check, transcription start/end (+duration), insertion, error, and tap re-enable is logged. The
-  harness tails this to assert on behavior and to debug failures without a screen.
-- `murmurctl status`/`last`/`sessions` expose state without log parsing.
-- Exit codes: `murmurctl` returns non-zero on error with a JSON `{error}` on stderr.
-
-### 10.5 Test layers (the agent's build-to-reliable loop)
-1. **Backend unit tests** (no permissions, XCTest + `murmur transcribe`): each fixture →
-   normalized/WER assertion. Proves the model + audio decoding work. Run first, iterate here
-   until green.
-2. **Persistence/retry unit tests:** create a session, kill transcription mid-way (inject a
-   failing `TranscriptionEngine` stub), assert audio survives, assert launch-recovery re-runs it,
-   assert `retry` produces the transcript. Simulate crash by asserting a truncated `audio.caf`
-   still decodes.
-3. **Hotkey unit test:** feed synthetic `CGEvent`s (or unit-test the `Trigger` matching logic in
-   isolation) for Fn+Space and the dev override; assert start/stop fire. (Full CGEventTap needs
-   Input Monitoring; keep the *matching logic* pure and unit-testable, separate from the tap.)
-4. **End-to-end via control socket** (needs the three permissions granted per
-   [§10.1](#101-permission-automation)):
-   - Launch `Murmur.app` with `MURMUR_TRIGGER=ropt-space`.
-   - `murmurctl permissions` → assert all true.
-   - Open **TextEdit** with a blank document (`open -e` / AppleScript), focus it.
-   - `murmurctl inject Tests/Fixtures/hello_world.wav`.
-   - Read TextEdit's content back via **AppleScript** (`tell app "TextEdit" to get text of document 1`)
-     or the Accessibility API, and assert it contains the expected words.
-   - This proves the *entire* real path: audio source → recorder → transcription → paste →
-     landed in a real third-party app. No mic, no human, fully deterministic.
-5. **Clipboard-restore test:** put a sentinel on the clipboard, run an `inject`, assert the
-   sentinel is restored after insertion.
-6. **Real-hotkey smoke (optional, best-effort):** post a synthetic `⌥`+`Space` via `CGEvent` and
-   assert recording starts — validates the tap itself end-to-end. May be flaky in headless CI;
-   keep it non-blocking.
+**Coverage honesty:** `inject` bypasses the real microphone/`AVAudioEngine` stack. To exercise the
+mic path without a human, optionally install a **virtual audio input device** (e.g. BlackHole) as
+bootstrap and play a fixture into it; otherwise state plainly that the mic path is covered by
+`MicAudioSource` unit tests + one manual smoke, not the automated loop. Don't let the harness's green
+imply mic/HUD coverage it doesn't have.
 
 ### 10.6 One-command harness & acceptance
-- `scripts/test.sh` runs: build → bundle → sign → grant-permissions → unit tests → launch app →
-  e2e socket tests → teardown (`reset-permissions`, quit). Exits non-zero on any failure and
-  prints a summary. **This is the loop the agent runs repeatedly until green.**
-- The app is "reliable" (done) when, on the target Mac:
-  - [ ] All backend + persistence + hotkey-logic unit tests pass.
-  - [ ] `scripts/test.sh` e2e passes **10 consecutive runs** (guards against flaky tap/paste/
-        timing races).
-  - [ ] Launch-recovery test: force-kill the app mid-transcription (send SIGKILL between
-        `start` and transcription completion), relaunch, assert the session auto-completes from
-        saved audio.
-  - [ ] `numbers.wav`, `hello_world.wav`, `the_quick_brown_fox.wav` land in TextEdit within WER
-        ≤ 0.1; `silence.wav` inserts nothing.
-  - [ ] No `error`-level log lines across a full `test.sh` run except those the failure tests
-        intentionally cause.
+`scripts/preflight.sh` fails fast unless: active GUI login session (`launchctl print gui/$UID`),
+Secure Input off, the three permissions granted, model present (S13). `scripts/test.sh`: preflight →
+build → bundle → sign → unit tests → launch app → e2e (InsertionProbe) → teardown (reset, quit).
+Non-zero on any failure, with a summary. **This is the loop the agent runs until green.**
 
-The agent should treat §10.6 as its definition of done and keep iterating (fixing bugs, adding
-missing seams) until every box is checked across repeated runs.
+Done when, on the provisioned Mac:
+- [ ] Milestone-0 spikes S1–S13 all pass (or the spec was corrected and REDTEAM.md updated).
+- [ ] Backend + persistence + hotkey-logic unit tests pass.
+- [ ] `scripts/test.sh` e2e passes **10 consecutive runs** (guards tap/paste/timing flakiness).
+- [ ] Crash recovery: SIGKILL the app mid-recording **and** mid-transcription (via `fault
+      transcribe-delay-ms`), relaunch, session auto-completes from saved audio.
+- [ ] `hello_world` / `the_quick_brown_fox` / `numbers` land in InsertionProbe (exact normalized);
+      `long_60s` within WER ≤ 0.1; `silence` inserts nothing.
+- [ ] No `error`-level logs across a full `test.sh` run except those failure tests intentionally cause.
+- [ ] Coverage note filed: what the loop proves vs. what's only unit-tested (mic, HUD) or manual.
 
 ---
 
@@ -524,194 +529,116 @@ missing seams) until every box is checked across repeated runs.
 Murmur/
   Package.swift
   Sources/
-    Murmur/                 # the app
-      MurmurApp.swift       # @main, MenuBarExtra, wires everything
-      AppModel.swift        # @MainActor state machine
-      Hotkey/HotkeyEngine.swift, Trigger.swift
-      Audio/AudioSource.swift, MicAudioSource.swift, FileAudioSource.swift, Recorder.swift
-      Transcribe/TranscriptionEngine.swift, ModelManager.swift, TranscriptProcessor.swift
+    MurmurKit/            # ALL logic (library)
+      AppModel.swift  (state only, @MainActor)
+      Hotkey/HotkeyEngine.swift, TriggerMatch.swift (pure)
+      Audio/AudioSource.swift, MicAudioSource.swift, FileAudioSource.swift, CaptureWorker.swift
+      Transcribe/TranscriptionBackend.swift, FluidAudioBackend.swift, VAD.swift, TranscriptProcessor.swift
       Session/SessionStore.swift, Session.swift
-      Insert/TextInserter.swift
-      UI/MenuBar.swift, TranscriptHUD.swift, PermissionsWindow.swift
-      Control/ControlServer.swift   # unix socket
-      Support/Log.swift, Config.swift, Permissions.swift
-    murmurctl/              # CLI client (swift-argument-parser)
-      main.swift
-  Tests/
-    MurmurTests/            # unit tests (backend, persistence, trigger logic)
-    Fixtures/*.wav
-  scripts/
-    bundle.sh make-cert.sh grant-permissions.sh reset-permissions.sh
-    run.sh test.sh make-fixtures.sh
-  assets/
-    Murmur.entitlements  Info.plist  murmur.pppc.mobileconfig
-  README.md  SPEC.md
+      Insert/TextInserter.swift, FocusTracker.swift
+      Control/ControlServer.swift, Protocol.swift
+      Support/Paths.swift (MURMUR_HOME), Log.swift, Config.swift, Permissions.swift
+    Murmur/               # GUI executable → MurmurKit
+      MurmurApp.swift, UI/MenuBar.swift, UI/TranscriptHUD.swift, UI/PermissionsWindow.swift
+    murmurctl/            # CLI client → MurmurKit protocol
+    murmur-smoke/         # headless fixture transcribe (earliest milestone)
+    InsertionProbe/       # test target: NSTextView + socket readback
+  Tests/MurmurTests/ , Tests/Fixtures/*.wav
+  spikes/                 # throwaway S1–S13 probes (fnprobe.swift, recorder-probe, api-spike, …)
+  scripts/                # bundle, make-cert, grant/reset-permissions, run, test, preflight, make-fixtures
+  assets/                 # Murmur.entitlements, Info.plist, murmur.pppc.mobileconfig
+  README.md  SPEC.md  REDTEAM.md
 ```
 
 ---
 
 ## 12. Milestones
-1. **Backend proves out:** `murmur transcribe <wav>` works on fixtures (FluidAudio download +
-   load + transcribe). Unit tests green. *No GUI, no permissions.*
-2. **Record loop headless:** `AudioSource`/`Recorder`/`SessionStore` + `murmurctl inject` — full
-   record→transcribe→session on disk, crash-safe CAF, retry + launch-recovery. Persistence tests
-   green.
-3. **Insertion + control socket:** `TextInserter` paste, `ControlServer`, e2e TextEdit test green.
-4. **Hotkey + menu bar + HUD:** `CGEventTap` Fn+Space (dev override), menu bar status, live
-   transcript pill. Permissions window.
-5. **Harden to acceptance:** run `scripts/test.sh` ×10, fix flakiness, meet every §10.6 box.
+0. **Spikes (§0).** S1–S13 green (highest-value first: S1–S3, S6–S9). No app code before S1–S3 pass.
+1. **Backend:** `murmur-smoke <wav>` transcribes fixtures; unit tests green. No GUI/permissions.
+2. **Record loop headless:** canonical `AudioSource`/`CaptureWorker`/`SessionStore` + `murmurctl
+   inject`; authoritative CAF; split-state retry + crash-mid-recording recovery. Persistence tests green.
+3. **Insertion + control socket + InsertionProbe:** paste with focus capture; expanded control API;
+   e2e green.
+4. **Hotkey + menu bar + HUD:** `CGEventTap` Ctrl+Space (Fn+Space pending S6/S7); menu status; live
+   pill (or "listening…" if S5 fails); permissions window.
+5. **Harden:** `scripts/test.sh` ×10, fix flakiness, meet every §10.6 box.
 
-Ship milestone by milestone; each is independently testable.
+Commit per milestone; each is independently testable.
 
 ---
 
-## 13. Open guesses (flagged for the human to redirect in seconds)
-- **Name "Murmur"** — pure guess; rename freely.
-- **Default trigger mode = toggle** (matches your FluidVoice `Fn` toggle setup). Say the word to
-  default to hold-to-talk.
-- **Auto-retry = 3 attempts, keep audio forever.** Matches "keep recordings" in your setup.
-- **Two-pass streaming+final** vs. simpler "partials for HUD, full re-transcribe on stop": spec
-  allows the fallback; implementer picks whichever is reliable first.
-- **Dev override = Right-Option+Space.** Change if it clashes with something you run.
+## 13. Open guesses (redirect in seconds)
+- **Name "Murmur"**, **bundle id `com.alejoacelas.murmur`** — rename freely (bundle id then propagates
+  to PPPC/cert/TCC).
+- **Test/fallback hotkey = Ctrl+Space; production Fn+Space pending S6/S7.** Say the word to make
+  Ctrl+Space (or another) the shipping default outright.
+- **Toggle only, English v2 only, keep-audio-forever, 3 transient retries.** All match your setup.
+- **Streaming partials best-effort** — if S5 is fiddly, the HUD shows "listening…" and partials are
+  deferred. Tell me if live partials are worth blocking on.
+- **Mic-path coverage** is unit-tested + optional virtual-device, not in the main e2e loop. Say if
+  you want a BlackHole-based mic e2e as a hard requirement.
 
 ---
 
 ## 14. Attribution & license
-- App: MIT (or your preference).
-- Bundles/downloads **NVIDIA Parakeet** (`parakeet-tdt-0.6b-v2` / `-v3`), **CC-BY-4.0** — credit
-  NVIDIA and link the model card in README + About.
-- Uses **FluidAudio** (Apache-2.0) — credit in README.
-- Design owes a large debt to **FluidVoice** (GPLv3) and **MacParakeet**; credit both.
+- App: MIT.
+- Bundles/downloads **NVIDIA Parakeet** (`parakeet-tdt-0.6b-v2`), **CC-BY-4.0** — credit NVIDIA + link
+  the model card in README/About.
+- **FluidAudio** (Apache-2.0) — credit. Design owes **FluidVoice** (GPLv3) and **MacParakeet** — credit both.
 
 ---
 
-These are working reference snippets, not final code — adapt naming/error handling to fit the
-modules in [§11](#11-project-layout).
-
-## Appendix A — reference `HotkeyEngine` (CGEventTap)
-Session-level `.defaultTap`; bare C callback with `self` via refcon; `flagsChanged` Fn-edge
-tracking; toggle vs hold; **mandatory `.tapDisabledByTimeout` re-enable**; swallow the trigger by
-returning `nil`.
+## Appendix A reference HotkeyEngine
+Session-level `.defaultTap`; bare C callback with `self` via refcon; **latched** Fn/Ctrl edge
+tracking from `flagsChanged`; **exact** modifier match; **swallow both keyDown & keyUp**; mandatory
+`.tapDisabledByTimeout` re-enable. Keep the match decision in a pure `TriggerMatch` function.
 
 ```swift
-import Cocoa
-import CoreGraphics
-
-final class HotkeyEngine {
-    var trigger: Trigger = .fnSpace
-    var onStart: () -> Void = {}
-    var onStop:  () -> Void = {}
-
-    private var tap: CFMachPort?
-    private var source: CFRunLoopSource?
-    private var fnIsDown = false
-    private var isRecording = false
-    private var fnDownAt: CFAbsoluteTime = 0
-    private let tapThreshold: CFTimeInterval = 0.30   // tap vs hold cutoff
-
-    func start() {
-        let mask = (1 << CGEventType.keyDown.rawValue)
-                 | (1 << CGEventType.keyUp.rawValue)
-                 | (1 << CGEventType.flagsChanged.rawValue)
-        let cb: CGEventTapCallBack = { _, type, event, refcon in
-            let me = Unmanaged<HotkeyEngine>.fromOpaque(refcon!).takeUnretainedValue()
-            return me.handle(type: type, event: event)
-        }
-        tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
-                                options: .defaultTap, eventsOfInterest: CGEventMask(mask),
-                                callback: cb, userInfo: Unmanaged.passUnretained(self).toOpaque())
-        guard let tap else { Log.warn("tap creation failed — Input Monitoring?"); return }
-        source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
-        CGEvent.tapEnable(tap: tap, enable: true)
-    }
-
-    private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
-        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
-            return Unmanaged.passUnretained(event)
-        }
-        let flags = event.flags
-        let fnNow = flags.contains(.maskSecondaryFn)
-        if type == .flagsChanged {
-            let kc = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
-            if kc == 0x3F {                               // kVK_Function
-                if fnNow && !fnIsDown { fnDown() }
-                else if !fnNow && fnIsDown { fnUp() }
-                fnIsDown = fnNow
-            }
-            if trigger.keyCode == nil { return nil }      // modifier-alone trigger: swallow
-        }
-        if type == .keyDown, let need = trigger.keyCode {
-            let kc = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
-            let fnOK  = trigger.usesFn ? fnNow : true
-            let modOK = flags.isSuperset(of: CGEventFlags(rawValue: trigger.modifierFlags))
-            if kc == need && fnOK && modOK { fire(); return nil }   // swallow the trigger
-        }
-        return Unmanaged.passUnretained(event)
-    }
-
-    private func fnDown() { fnDownAt = CFAbsoluteTimeGetCurrent()
-        if trigger.keyCode == nil && trigger.mode == .holdToTalk { begin() } }
-    private func fnUp() {
-        guard trigger.keyCode == nil else { return }
-        if trigger.mode == .holdToTalk { end() }
-        else if CFAbsoluteTimeGetCurrent() - fnDownAt < tapThreshold { toggle() }
-    }
-    private func fire() { trigger.mode == .holdToTalk ? (isRecording ? end() : begin()) : toggle() }
-    private func begin()  { guard !isRecording else { return }; isRecording = true;  onStart() }
-    private func end()    { guard isRecording  else { return }; isRecording = false; onStop() }
-    private func toggle() { isRecording ? end() : begin() }
+// Pure, unit-testable core (layer-3 tests call THIS, no live tap):
+struct LatchedState { var fnDown = false; var ctrlDown = false /* … */ }
+enum TriggerHit { case fire, none }
+func triggerHit(_ trigger: Trigger, _ latched: LatchedState,
+                type: CGEventType, keyCode: CGKeyCode) -> TriggerHit {
+    guard type == .keyDown, keyCode == trigger.keyCode else { return .none }
+    // exact match on the latched required modifier set (NOT the event's own flags, NOT superset):
+    return trigger.matches(latched) ? .fire : .none
 }
 ```
-> Keep `Trigger` matching pure and unit-testable ([§10.5](#105-test-layers-the-agents-build-to-reliable-loop) layer 3):
-> factor the "does this event match the trigger" decision into a function you can call with
-> synthetic inputs, separate from the live tap.
-
-## Appendix B — reference `Recorder` (crash-safe audio)
-`AVAudioEngine` input tap at **hardware** format → `AVAudioConverter` → 16 kHz mono Int16 →
-append to a streaming `AVAudioFile` CAF each buffer → on stop, transcode to WAV atomically.
-
 ```swift
-let targetFormat = AVAudioFormat(commonFormat: .pcmFormatInt16,
-                                 sampleRate: 16_000, channels: 1, interleaved: true)!
+// Live tap wiring (adapts v1 Appendix A): track Fn(0x3F)/Ctrl(0x3B) up/down edges from
+// flagsChanged into LatchedState; on keyDown call triggerHit(); on a fire, toggle recording and
+// return nil; ALSO return nil for the matching keyUp; re-enable on .tapDisabledByTimeout/UserInput.
+```
 
-func start(to cafURL: URL) throws {
-    let input = engine.inputNode
-    let hw = input.outputFormat(forBus: 0)            // MUST use hardware format for the tap
-    converter = AVAudioConverter(from: hw, to: targetFormat)
-    cafFile = try AVAudioFile(forWriting: cafURL, settings: targetFormat.settings,
-                              commonFormat: .pcmFormatInt16, interleaved: true)
-    input.installTap(onBus: 0, bufferSize: 4096, format: hw) { [weak self] buf, _ in
-        self?.process(buf)                            // convert, write(from:) to CAF, feed streamer
-    }
-    engine.prepare(); try engine.start()
-}
-// process(): AVAudioConverter.convert → try? cafFile.write(from: out)  (appends + flushes)
-
-let wavSettings: [String: Any] = [
+## Appendix B reference capture
+Tap callback **enqueues only**; `CaptureWorker` (serial) converts + writes.
+```swift
+let canonical = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                              sampleRate: 16_000, channels: 1, interleaved: false)!
+// MicAudioSource: installTap(onBus:0, format: hardwareFormat) { buf, _ in
+//     let copy = buf.deepCopy(); worker.enqueue(copy)      // NOTHING else on the audio thread
+// }
+// CaptureWorker.enqueue → serial actor: AVAudioConverter → canonical → cafFile.write(from:)
+//     (append); every ~2s: fsync the CAF fd. Feed streaming session if present.
+// stop() async: signal EOF, drain queue, close cafFile, then return.  (WAV transcode is derived.)
+let wavSettings: [String: Any] = [   // only for the derived cache artifact
     AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 16_000, AVNumberOfChannelsKey: 1,
     AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false,
 ]
-// finalize: write WAV to a temp path, FileHandle.synchronize() (fsync), then
-// FileManager.replaceItemAt(dest, withItemAt: tmp)  — atomic swap, never a partial file.
 ```
-`FileAudioSource` (test injection) replays a WAV's frames through the **same** `process()` path so
-injected and mic audio are indistinguishable downstream.
+`FileAudioSource` replays a WAV's frames through the same `worker.enqueue` path.
 
-## Appendix C — reference `TextInserter`
-Paste (default): snapshot all `NSPasteboard` items → set our string → post `Cmd`+`V` `CGEvent`s →
-restore the snapshot after 0.15s (sync restore races the paste). Type (fallback):
-`CGEventKeyboardSetUnicodeString` in ~20-char chunks with `usleep`. Both gate on
-`AXIsProcessTrustedWithOptions`.
-
+## Appendix C reference TextInserter
+Capture focus at start (`FocusTracker`); re-check before insert. Paste: snapshot pasteboard → set
+string → post `Cmd`+`V` → best-effort restore after a configurable delay (lossy; documented). Type
+fallback: `CGEventKeyboardSetUnicodeString` in ~20-char chunks (ASCII-ish only). Gate on
+`AXIsProcessTrustedWithOptions`. Probe `.cgAnnotatedSessionEventTap` vs `.cghidEventTap` and
+standardize on the accepted one.
 ```swift
-func insertViaPaste(_ text: String) {
+func insertViaPaste(_ text: String) {   // (adapts v1 Appendix C — add focus re-check + configurable delay)
     let pb = NSPasteboard.general
     let saved = pb.pasteboardItems?.map { item -> NSPasteboardItem in
-        let c = NSPasteboardItem()
-        for t in item.types { if let d = item.data(forType: t) { c.setData(d, forType: t) } }
-        return c
+        let c = NSPasteboardItem(); for t in item.types { if let d = item.data(forType: t) { c.setData(d, forType: t) } }; return c
     } ?? []
     pb.clearContents(); pb.setString(text, forType: .string)
     let src = CGEventSource(stateID: .combinedSessionState)
@@ -719,8 +646,10 @@ func insertViaPaste(_ text: String) {
     let up   = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: false)
     down?.flags = .maskCommand; up?.flags = .maskCommand
     down?.post(tap: .cgAnnotatedSessionEventTap); up?.post(tap: .cgAnnotatedSessionEventTap)
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-        pb.clearContents(); pb.writeObjects(saved)
+    if Config.preserveClipboard {
+        DispatchQueue.main.asyncAfter(deadline: .now() + Config.clipboardRestoreDelay) {
+            pb.clearContents(); pb.writeObjects(saved)
+        }
     }
 }
 ```
