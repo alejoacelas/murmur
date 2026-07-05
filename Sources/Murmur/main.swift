@@ -19,7 +19,7 @@ Log.info("app.start", msg: "home=\(Paths.home.path) trigger=\(config.trigger.raw
 
 let store = SessionStore()
 let backend = FluidAudioBackend()
-let inserter = LoggingInserter()  // M3 replaces with the real paste inserter
+let inserter = PasteInserter(config: config)
 let engine = Engine(store: store, backend: backend, inserter: inserter, config: config)
 let server = ControlServer(engine: engine, backend: backend)
 

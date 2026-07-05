@@ -45,6 +45,11 @@ let package = Package(
             dependencies: ["MurmurKit"],
             path: "Sources/murmurctl"
         ),
+        // e2e paste target: focused NSTextView mirrored to a readback file (SPEC §10.5).
+        .executableTarget(
+            name: "InsertionProbe",
+            path: "Sources/InsertionProbe"
+        ),
         .testTarget(
             name: "MurmurTests",
             dependencies: ["MurmurKit"],
