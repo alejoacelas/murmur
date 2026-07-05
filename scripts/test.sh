@@ -24,10 +24,13 @@ trap 'rm -rf "$UNIT_HOME"' EXIT
 (cd "$MURMUR_REPO" && MURMUR_HOME="$UNIT_HOME" swift test 2>&1 \
   | grep -E "Test Suite '(All tests|.*Tests)' (passed|failed)|Executed.*failures" | tail -8)
 
+echo "== crash recovery e2e =="
+bash "$MURMUR_REPO/scripts/crash-e2e.sh"
+
 echo "== e2e ×$E2E_RUNS =="
 for i in $(seq 1 "$E2E_RUNS"); do
   echo "-- e2e run $i/$E2E_RUNS --"
   bash "$MURMUR_REPO/scripts/e2e.sh"
 done
 
-echo "test.sh: ALL GREEN (unit + e2e×$E2E_RUNS)"
+echo "test.sh: ALL GREEN (unit + crash-recovery + e2e×$E2E_RUNS)"
