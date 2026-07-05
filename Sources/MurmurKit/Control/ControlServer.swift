@@ -212,8 +212,10 @@ public actor ControlServer {
             return ControlProtocol.ok(["sessions": all])
 
         case "hud":
-            let (visible, partial) = await engine.hudState
-            return ControlProtocol.ok(["visible": visible, "lastPartial": partial])
+            let (phase, partial) = await engine.hudState
+            return ControlProtocol.ok([
+                "visible": phase != .hidden, "phase": phase.rawValue, "lastPartial": partial,
+            ])
 
         case "fault":
             guard let kind = req.kind, let value = req.value else {

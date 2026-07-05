@@ -37,10 +37,16 @@ public actor Engine {
     private var lastSessionId: String?
     private var faults = Faults()
 
-    // HUD observability (SPEC §6): state is here so `murmurctl hud` can report it headlessly.
-    private var hudVisible = false
+    // HUD observability (SPEC §6): state is here so `murmurctl hud` can report it headlessly
+    // and the UI layer just mirrors it.
+    public enum HUDPhase: String, Sendable {
+        case hidden, recording, transcribing
+    }
+    private var hudPhase: HUDPhase = .hidden
     private var lastPartial = ""
-    private var hudObservers: [@Sendable (Bool, String) -> Void] = []
+    private var hudObservers: [@Sendable (HUDPhase, String) -> Void] = []
+    /// Debounces hotkey toggles while a stop→transcribe transition is in flight.
+    private var toggleInFlight = false
 
     public init(
         store: SessionStore, backend: TranscriptionBackend, inserter: TextInserter,
@@ -122,9 +128,36 @@ public actor Engine {
         active = ActiveRecording(
             id: meta.id, source: src, worker: worker, feedTask: feedTask,
             continuation: continuation, partialsTask: partialsTask, focus: focus)
-        setHUD(visible: true, partial: "")
+        setHUD(phase: .recording, partial: "")
         Log.info("record.start", msg: "id=\(meta.id)")
         return meta.id
+    }
+
+    /// Hotkey entry point: tap-to-start / tap-to-stop (SPEC §4.1 toggle mode). Errors are
+    /// logged, never thrown — a hotkey press has no caller to catch.
+    public func toggle() async {
+        guard !toggleInFlight else {
+            Log.debug("hotkey.toggle_ignored", msg: "transition in flight")
+            return
+        }
+        if isRecording {
+            toggleInFlight = true
+            defer { toggleInFlight = false }
+            do {
+                let meta = try await stopAndFinalize()
+                let id = meta.id
+                Task { await self.runToCompletion(id) }
+            } catch {
+                Log.error("hotkey.stop_failed", msg: "\(error)")
+            }
+        } else {
+            do {
+                _ = try await startRecording()
+            } catch {
+                Log.error("hotkey.start_failed", msg: "\(error)")
+                setHUD(phase: .hidden, partial: "")
+            }
+        }
     }
 
     /// Stop recording, drain the pipeline, close the capture file (SPEC §3 async boundary).
@@ -147,7 +180,7 @@ public actor Engine {
         meta.durationSec = duration
         try await store.save(meta)
         AudioFiles.transcodeToWAV(caf: store.cafURL(cur.id), wav: store.wavURL(cur.id))
-        setHUD(visible: true, partial: lastPartial)  // stays up through transcribing (§6)
+        setHUD(phase: .transcribing, partial: lastPartial)  // stays up through transcribing (§6)
         Log.info("record.stop", msg: "id=\(cur.id) durationSec=\(duration) rms=\(rms)")
         pendingFocus[cur.id] = cur.focus
         return meta
@@ -193,7 +226,7 @@ public actor Engine {
                     "transcribe.failed",
                     msg: "id=\(id) attempt=\(meta.attempts) class=\(meta.failureClass!.rawValue) err=\(error)")
                 if meta.failureClass == .permanent || meta.attempts >= 3 {
-                    setHUD(visible: false, partial: "")
+                    setHUD(phase: .hidden, partial: "")
                     return
                 }
                 try? await Task.sleep(nanoseconds: UInt64(200 * meta.attempts) * 1_000_000)
@@ -204,7 +237,7 @@ public actor Engine {
         if meta.state == .transcribed || meta.state == .inserting || meta.state == .insertFailed {
             await insertStep(&meta)
         }
-        setHUD(visible: false, partial: "")
+        setHUD(phase: .hidden, partial: "")
     }
 
     /// VAD gate + faults + authoritative batch pass over the saved audio (identical to a retry).
@@ -396,22 +429,22 @@ public actor Engine {
 
     // MARK: - HUD state (SPEC §6 testability)
 
-    public var hudState: (visible: Bool, lastPartial: String) { (hudVisible, lastPartial) }
+    public var hudState: (phase: HUDPhase, lastPartial: String) { (hudPhase, lastPartial) }
 
     /// UI layers register to mirror HUD state; called on the engine's executor.
-    public func onHUDChange(_ observer: @escaping @Sendable (Bool, String) -> Void) {
+    public func onHUDChange(_ observer: @escaping @Sendable (HUDPhase, String) -> Void) {
         hudObservers.append(observer)
     }
 
-    private func setHUD(visible: Bool, partial: String) {
-        hudVisible = visible
+    private func setHUD(phase: HUDPhase, partial: String) {
+        hudPhase = phase
         lastPartial = partial
-        for o in hudObservers { o(visible, partial) }
+        for o in hudObservers { o(phase, partial) }
     }
 
     private func setPartial(_ text: String) {
-        guard hudVisible else { return }
+        guard hudPhase == .recording else { return }
         lastPartial = text
-        for o in hudObservers { o(true, text) }
+        for o in hudObservers { o(hudPhase, text) }
     }
 }

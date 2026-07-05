@@ -113,7 +113,34 @@ RESTORED="$(pbpaste)"
 [ "$RESTORED" = "$SENTINEL" ] || fail "clipboard not restored: got \"$RESTORED\""
 echo "e2e: clipboard restore OK"
 
-# 7) No error-level logs in a clean run (SPEC §10.6).
+# 7) OPTIONAL real-hotkey smoke (SPEC §10.4 layer 6, non-blocking): synthetic Ctrl+Space starts
+#    a real MIC recording; second chord stops it. Runs with the probe focused so any ambient
+#    speech lands there and nowhere else. Ambient silence → VAD gate → empty insert.
+hotkey_smoke() {
+  local post="$MURMUR_REPO/build/postkeys"
+  if [ ! -x "$post" ]; then
+    swiftc -O -o "$post" "$MURMUR_REPO/scripts/postkeys.swift" 2>/dev/null || return 1
+  fi
+  clear_probe
+  assert_probe_focused
+  "$post" >/dev/null || return 1
+  local up=""
+  for _ in $(seq 1 20); do
+    if "$CTL" health | grep -q '"recording":true'; then up=1; break; fi
+    sleep 0.2
+  done
+  [ -n "$up" ] || { echo "e2e: hotkey smoke — recording never started" >&2; return 1; }
+  sleep 1.2
+  "$post" >/dev/null || return 1
+  "$CTL" await-state inserted --timeout 60 >/dev/null || {
+    echo "e2e: hotkey smoke — never reached inserted" >&2; return 1; }
+  echo "e2e: hotkey smoke OK (tap fired, mic session completed)"
+}
+if [ "${MURMUR_E2E_HOTKEY:-1}" = "1" ]; then
+  hotkey_smoke || echo "e2e: WARN hotkey smoke failed (non-blocking; tap flakiness is a known headless risk)"
+fi
+
+# 8) No error-level logs in a clean run (SPEC §10.6).
 if grep -q '"level":"error"' "$MURMUR_HOME/logs/murmur.log" 2>/dev/null; then
   grep '"level":"error"' "$MURMUR_HOME/logs/murmur.log" >&2
   fail "error-level log lines in a clean e2e run"
