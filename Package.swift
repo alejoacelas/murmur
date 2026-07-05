@@ -7,6 +7,8 @@ let package = Package(
         .macOS(.v14)
     ],
     products: [
+        .executable(name: "Murmur", targets: ["Murmur"]),
+        .executable(name: "murmurctl", targets: ["murmurctl"]),
         .executable(name: "murmur-smoke", targets: ["murmur-smoke"]),
     ],
     dependencies: [
@@ -30,6 +32,18 @@ let package = Package(
             name: "murmur-smoke",
             dependencies: ["MurmurKit"],
             path: "Sources/murmur-smoke"
+        ),
+        // The app process: engine + control server (+ menu bar/HUD from M4).
+        .executableTarget(
+            name: "Murmur",
+            dependencies: ["MurmurKit"],
+            path: "Sources/Murmur"
+        ),
+        // Thin control-socket client (SPEC §10.2).
+        .executableTarget(
+            name: "murmurctl",
+            dependencies: ["MurmurKit"],
+            path: "Sources/murmurctl"
         ),
         .testTarget(
             name: "MurmurTests",

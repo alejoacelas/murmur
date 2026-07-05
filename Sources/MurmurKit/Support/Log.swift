@@ -22,6 +22,11 @@ public enum Log {
     public static func warn(_ event: String, msg: String = "") { write(.warn, event, msg) }
     public static func error(_ event: String, msg: String = "") { write(.error, event, msg) }
 
+    /// Drain pending writes — call before exiting on a fatal path or async logs are lost.
+    public static func flush() {
+        queue.sync {}
+    }
+
     private static func write(_ level: Level, _ event: String, _ msg: String) {
         let now = Date()
         queue.async {
