@@ -1,0 +1,7 @@
+{
+  "hello_world.wav": "hello world",
+  "the_quick_brown_fox.wav": "the quick brown fox jumps over the lazy dog",
+  "numbers.wav": "testing 123",
+  "silence.wav": "",
+  "long_60s.wav": "Murmur is a small local dictation tool for macOS. It records your voice, transcribes it entirely on device with Parakeet, and drops the text at your cursor. Nothing is uploaded, there is no account, and there is no cleanup step by default. This clip is about a minute long so the tests exercise chunking and timing over a longer recording without any human speaking into a microphone."
+}
