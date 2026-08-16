@@ -1,8 +1,3 @@
----
-human_edit_tracking:
-  enabled: true
-  history: []
----
 # Murmur
 
 A minimal, local dictation app for macOS — my open alternative to Wispr Flow, in the spirit of [FluidVoice](https://github.com/altic-dev/FluidVoice). Press `Ctrl`+`Space`, talk, press it again, and the transcript lands at your cursor. Everything runs on-device with NVIDIA Parakeet — no cloud, no account, and no LLM "cleanup" by default. Just your words.

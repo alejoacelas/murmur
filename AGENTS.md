@@ -1,8 +1,3 @@
----
-human_edit_tracking:
-  enabled: true
-  history: []
----
 # For the implementing agent
 
 You are building **Murmur** from [SPEC.md](SPEC.md) (v2; see [REDTEAM.md](REDTEAM.md) for why it's
