@@ -18,4 +18,4 @@ must-have features unless the user expands the scope.
   Use `scripts/test.sh 10` for acceptance/hardening changes. Report missing prerequisites
   and coverage gaps; fixture injection does not prove live microphone or HUD visuals.
 
-Record substantive maintenance and verification in [REPLICATE.md](REPLICATE.md).
+Keep current consequential choices and their reasons in [DECISIONS.md](DECISIONS.md); do not append maintenance or verification logs.
